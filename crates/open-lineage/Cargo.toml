@@ -1,0 +1,51 @@
+[package]
+name = "datafusion-openlineage"
+version = "0.0.7"
+description = "OpenLineage integration for Apache DataFusion sessions"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository = "https://github.com/open-lakehouse/headwaters"
+homepage = "https://github.com/open-lakehouse/headwaters/tree/main/crates/open-lineage"
+documentation = "https://docs.rs/datafusion-openlineage"
+readme = "README.md"
+keywords = ["datafusion", "openlineage", "lineage", "observability"]
+categories = ["database", "development-tools::debugging"]
+
+[dependencies]
+# The engine-agnostic event model, Transport seam, and emit client.
+openlineage-client = { path = "../openlineage-client", version = "0.0.4", default-features = false }
+datafusion = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+# OpenLineage recommends time-ordered (v7) UUIDs for run ids.
+uuid = { workspace = true, features = ["v7", "serde"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["http"]
+# Forwards to openlineage-client's HTTP transport (CloudClientTransport).
+http = ["openlineage-client/http"]
+# Opt-in: the live Marquez reference-backend acceptance test (tests/marquez_acceptance.rs).
+# It additionally needs Docker; the test is also `#[ignore]`d so even with the
+# feature on it only runs under `-- --ignored`. Requires `http` for the transport.
+marquez-it = ["http"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+# Offline OpenLineage spec conformance: validate emitted events against the
+# vendored JSON Schemas in tests/schemas/ (see tests/conformance.rs).
+jsonschema = "0.46"
+# Live Marquez reference-backend acceptance test (gated by the `marquez-it`
+# feature + `#[ignore]`; see tests/marquez_acceptance.rs).
+testcontainers = { version = "0.27", features = ["http_wait"] }
+reqwest = { version = "0.12", features = ["json"] }
+# The e2e_pipeline example installs a subscriber so its `console` dry-run mode
+# (ConsoleTransport, which logs events via tracing) actually prints.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The e2e_pipeline example parses endpoint URLs for the HTTP transport.
+url = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }

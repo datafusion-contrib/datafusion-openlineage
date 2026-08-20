@@ -1,0 +1,37 @@
+repos:
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.32.0
+    hooks:
+      - id: typos
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.2
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/bnjbvr/cargo-machete
+    rev: v0.9.1
+    hooks:
+      - id: cargo-machete
+        name: cargo machete
+
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check --color always
+        language: system
+        pass_filenames: false
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+  - repo: https://github.com/bufbuild/buf
+    rev: v1.59.0
+    hooks:
+      - id: buf-format

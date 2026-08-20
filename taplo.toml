@@ -1,0 +1,21 @@
+include = [
+    "Cargo.toml",
+    "clippy.toml",
+    "crates/**/Cargo.toml",
+    "*/Cargo.toml",
+    "pyproject.toml",
+    "*/pyproject.toml",
+]
+exclude = [".venv/**", "target/**", "java/**"]
+
+[formatting]
+allowed_blank_lines = 1
+indent_string = "    "
+reorder_keys = false
+
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = ["workspace.dependencies", "dependencies", "dev-dependencies"]
+
+[rule.formatting]
+reorder_keys = true

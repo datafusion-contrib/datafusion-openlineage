@@ -1,0 +1,124 @@
+# release-plz configuration — automated, independent per-crate releases.
+#
+# release-plz (https://release-plz.dev) is the Rust-native release tool (NOT
+# Google's release-please). It analyzes conventional commits *per crate* to
+# compute semver bumps, regenerates per-crate changelogs, keeps intra-workspace
+# dependency version requirements in sync, and publishes to crates.io in
+# topological order. PR titles are gated by .github/workflows/pr-title.yml; see
+# CONTRIBUTING.md for the end-to-end flow.
+#
+# All crates are versioned, changelogged, tagged and GitHub-released — but they
+# diverge at the publish step:
+#   - openlineage-client     -> published to crates.io (a library).
+#   - datafusion-openlineage -> published to crates.io (depends on the client,
+#     so release-plz publishes the client first).
+#   - headwaters-proto       -> published to crates.io (generated proto + stubs).
+#   - headwaters-client      -> published to crates.io (depends on headwaters-proto,
+#     so release-plz publishes the proto crate first).
+#   - headwaters             -> `git_only = true`: a deployable app, NOT
+#     published to crates.io. release-plz versions/changelogs/tags it from git
+#     (not the registry), and its git tag `headwaters-v<version>` triggers the
+#     Docker image build/push to GHCR (see release-plz.yml ->
+#     .github/workflows/docker-release.yml). Its bundled UI participates via
+#     crates/headwaters/ui.lock — see `just ui-fingerprint`.
+#
+# Config reference: https://release-plz.dev/docs/config
+
+[workspace]
+# Link PRs/commits in the generated changelog back to the repo.
+repo_url = "https://github.com/open-lakehouse/headwaters"
+
+# --- Versioning / changelog ---
+changelog_update = true        # regenerate per-crate CHANGELOG.md on each release
+dependencies_update = false    # don't `cargo update` during the release PR —
+                               # keeps Cargo.lock churn out of release commits
+semver_check = true            # run cargo-semver-checks before bumping, to catch
+                               # accidental breaking changes in published crates
+
+# --- Git tags & GitHub releases (per-crate) ---
+# Per-crate tags, e.g. `datafusion-openlineage-v0.1.0` / `headwaters-v0.1.0`.
+# The headwaters tag is what the Docker release workflow keys off, and the
+# prefix keeps each crate's tags distinct.
+git_tag_enable = true
+git_tag_name = "{{ package }}-v{{ version }}"
+git_release_enable = true
+git_release_name = "{{ package }} v{{ version }}"
+git_release_body = "{{ changelog }}"
+
+# --- Publishing ---
+# release-plz runs `cargo publish` itself, in dependency order. With
+# `id-token: write` in the workflow it performs crates.io OIDC publishing, so
+# NO CARGO_REGISTRY_TOKEN is required. `headwaters` opts out below.
+publish = true
+publish_timeout = "30m"        # protoc/codegen-heavy crates are slow to verify
+
+# --- Release PR appearance ---
+pr_labels = ["release"]
+pr_draft = false
+
+# ---------------------------------------------------------------------------
+# Per-package overrides.
+# ---------------------------------------------------------------------------
+[[package]]
+name = "headwaters"
+# Version + changelog + git tag + GitHub release, but no `cargo publish` — the
+# tag drives the Docker release instead.
+#
+# `git_only = true` (NOT `publish = false`) is what makes that work. headwaters
+# has `publish = false` in its Cargo.toml, so it isn't on crates.io; with a
+# plain release-plz `publish = false` override, release-plz would still try to
+# read the crate's "current version" from the cargo registry, fail to find it,
+# and silently SKIP the crate — no bump, no tag, so the Docker job never fires.
+# `git_only` instead derives the current version from the existing
+# `headwaters-v<version>` git tag (the `git_tag_name` pattern in [workspace]),
+# bumps from the conventional-commit history, writes the changelog, and creates
+# the next tag + GitHub release — everything except `cargo publish`. (Cargo.toml
+# `publish = false` also stays as the belt-and-suspenders publish guard.)
+#
+# release-plz requires `publish = false` to be set explicitly alongside
+# `git_only = true` (the two are mutually exclusive, and the [workspace] default
+# is `publish = true`), so both are pinned here.
+git_only = true
+publish = false
+
+[[package]]
+name = "headwaters-cli"
+# Versioned/tagged/changelogged from git like `headwaters`, but not published to
+# crates.io yet — `publish = false` in Cargo.toml, so the same `git_only = true`
+# treatment applies (see the `headwaters` block above for why both are needed).
+# Flip to crates.io publishing later if `cargo install headwaters-cli` is wanted.
+git_only = true
+publish = false
+
+[[package]]
+name = "datafusion-openlineage"
+# The crate's directory is `crates/open-lineage/` (only the package name was
+# renamed), so pin the changelog path explicitly.
+changelog_path = "crates/open-lineage/CHANGELOG.md"
+
+# ---------------------------------------------------------------------------
+# Changelog rendering (git-cliff, embedded). Conventional-commit grouping.
+# Because commits use crate scopes (feat(client): ...), each crate's changelog
+# naturally contains only commits that touched its files.
+# ---------------------------------------------------------------------------
+[changelog]
+protect_breaking_commits = true
+sort_commits = "newest"
+
+commit_parsers = [
+  { message = "^feat",     group = "Added" },
+  { message = "^fix",      group = "Fixed" },
+  { message = "^perf",     group = "Performance" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^doc",      group = "Documentation" },
+  { message = "^build",    group = "Build" },
+  { message = "^test",     skip = true },
+  { message = "^chore",    skip = true },
+  { message = "^ci",       skip = true },
+]
+
+# Strip the redundant "(scope)" from each rendered line — each crate's changelog
+# is already crate-scoped.
+commit_preprocessors = [
+  { pattern = '\((openlineage-client|client|datafusion-openlineage|open-lineage|headwaters|headwaters-proto|proto|headwaters-client|read-client|headwaters-cli|read-cli|cli)\)', replace = "" },
+]

@@ -1,0 +1,162 @@
+name: Release-plz
+
+# Automated releases. On every push to `main`, release-plz opens/updates a
+# single "Release PR" containing per-crate version bumps + regenerated
+# changelogs. When that PR is merged, release-plz creates the per-crate git
+# tags + GitHub Releases. Both crates are versioned/tagged/released; they
+# diverge at publish: datafusion-openlineage publishes to crates.io, while
+# headwaters is `publish = false` (a deployable app) and instead has its
+# container image built by the `docker` job here.
+# See release-plz.toml; CONTRIBUTING.md has the full flow.
+
+on:
+  push:
+    branches:
+      - main
+
+# Least privilege: grant per job, nothing at the top level.
+permissions: {}
+
+jobs:
+  # --- Open/update the Release PR (version bumps + changelogs) ---
+  release-plz-pr:
+    name: Release PR
+    # Never run from forks — they must not open release PRs.
+    if: ${{ github.repository == 'open-lakehouse/headwaters' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the release-plz-* branch
+      pull-requests: write # create/update the Release PR
+    # Avoid two pushes to main racing to open/update the same PR.
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # release-plz needs full history to analyze commits
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.96"
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "31.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run release-plz (release-pr)
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --- Tag + GitHub Release + cargo publish, after the Release PR is merged ---
+  # datafusion-openlineage publishes to crates.io; headwaters is
+  # `publish = false` + `git_only = true` in release-plz.toml, so it is only
+  # tagged + GitHub-released — its Docker image is built by the `docker` job
+  # below.
+  #
+  # NOTE: release-plz does NOT include `git_only` packages in the `releases`
+  # JSON its `release` command emits — so we cannot key the Docker trigger off
+  # that array (doing so silently skips headwaters forever). Instead the
+  # `service` step below derives the version from crates/headwaters/Cargo.toml
+  # (which the merged Release PR already bumped) and, if no matching
+  # `headwaters-v<version>` tag exists yet, creates it + a GitHub Release. The
+  # presence of a freshly-created tag is what fires the Docker job.
+  release-plz-release:
+    name: Release
+    if: ${{ github.repository == 'open-lakehouse/headwaters' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release # protected env gating the crates.io publish
+    permissions:
+      contents: write # create tags + GitHub Releases
+      id-token: write # crates.io OIDC publish
+    outputs:
+      # Version + tag of headwaters IF this run released it (i.e. the manifest
+      # version was ahead of the tags and we created the tag), else empty.
+      service_version: ${{ steps.service.outputs.version }}
+      service_tag: ${{ steps.service.outputs.tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.96"
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "31.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # No CARGO_REGISTRY_TOKEN: crates.io publish authenticates via OIDC
+      # (`id-token: write`).
+      - name: Run release-plz (release)
+        id: release
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Tag + release headwaters ourselves. release-plz omits `git_only`
+      # packages from its `releases` output, so we cannot read the version from
+      # there. Read it from the manifest the Release PR already bumped, and if
+      # the `headwaters-v<version>` tag does not exist yet, create it + a GitHub
+      # Release. Setting `version`/`tag` then fires the Docker job. When the tag
+      # already exists (e.g. a re-run, or a push that did not bump headwaters),
+      # the outputs stay empty and Docker is skipped — idempotent by design.
+      - name: Tag + release headwaters
+        id: service
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(grep -m1 '^version = ' crates/headwaters/Cargo.toml \
+            | sed -E 's/^version = "([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::could not parse headwaters version from Cargo.toml"
+            exit 1
+          fi
+          tag="headwaters-v${version}"
+          # The remote is the source of truth (this checkout has persist-
+          # credentials=false, so we don't push via git here — `gh release
+          # create` creates the tag at HEAD and authenticates via GH_TOKEN).
+          if gh release view "$tag" >/dev/null 2>&1 \
+            || git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
+            echo "Tag/release ${tag} already exists — headwaters not released this run."
+            exit 0
+          fi
+          echo "Releasing headwaters ${version} (tag ${tag})."
+          # `gh release create` creates the tag at the current commit (the merge
+          # commit that bumped the manifest) and the GitHub Release in one step.
+          # Body is the crate's changelog section for THIS version (skipping the
+          # leading `## [Unreleased]`), matching what release-plz produces for
+          # the published crates.
+          notes=$(awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}' crates/headwaters/CHANGELOG.md)
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "headwaters v${version}" \
+            --notes "${notes:-headwaters v${version}}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # --- Build + push the headwaters Docker image, iff it was released ---
+  # Reuses .github/workflows/docker-release.yml with the exact version release-
+  # plz reported. Skips when the service wasn't part of this release.
+  docker:
+    name: Docker release
+    needs: release-plz-release
+    if: ${{ needs.release-plz-release.outputs.service_version != '' }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/docker-release.yml
+    with:
+      version: ${{ needs.release-plz-release.outputs.service_version }}
+      ref: ${{ needs.release-plz-release.outputs.service_tag }}

@@ -1,0 +1,32 @@
+# Spell-check configuration for `crate-ci/typos` (see .github/workflows/typos.yml).
+
+[default]
+extend-ignore-re = [
+    # Custom ignore regex patterns: https://github.com/crate-ci/typos/blob/master/docs/reference.md#example-configurations
+    "(?s)//\\s*spellchecker:ignore-next-line[^\\n]*\\n[^\\n]*",
+    # Line block with # spellchecker:<on|off>
+    "(?s)(#|//|<\\!--)\\s*spellchecker:off.*?\\n\\s*(#|//|<\\!--)\\s*spellchecker:on",
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",
+]
+
+[default.extend-words]
+# to avoid having to name fields r#type
+typ = "typ"
+
+# Pluralized SQL keywords in prose/tests ("SELECTs", "INSERTs"): typos strips the
+# trailing "s" and flags the stem as a misspelling of SELECT / INSERT.
+selec = "selec"
+inser = "inser"
+
+# Hyphenated "mis-" prefix ("mis-creating", "mis-route"): the prefix is tokenized
+# on its own and flagged as a misspelling of miss/mist.
+mis = "mis"
+
+# We only want typos to police code we own. Generated proto/ConnectRPC code
+# carries tokens we don't control — including base64-encoded descriptors that
+# trip the checker (e.g. "IY"->"IT", "IZ"->"IS"). Exclude the generated trees
+# wholesale (their mod.rs stitching is generated too, "DO NOT EDIT").
+[files]
+extend-exclude = [
+    "node/lineage-client/src/gen/**",
+]

@@ -1,0 +1,47 @@
+# Coverage is reported but never blocks a PR while it beds in. Both project and
+# patch statuses are informational, so a coverage drop shows up in the Codecov
+# comment/status without turning the check red. Tighten (drop `informational`,
+# add a `target`) once a baseline is trusted.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Exclude code we never want counted against coverage. The big skew is the
+# committed codegen (thousands of machine-generated lines tests never exercise
+# directly), which drags the denominator down: the buffa-generated proto message
+# types and the connectrpc service stubs, both in the headwaters-proto crate.
+# Also drop examples and test helpers (exercised by running them, not by
+# assertions).
+#
+# Paths are matched against the report's workspace-relative file paths. Keep this
+# in sync with the CI coverage job's `--ignore-filename-regex`. Regenerate the
+# codegen with `just proto-gen`.
+ignore:
+  # Generated proto message types. The sibling proto/mod.rs is hand-written, so
+  # it is NOT ignored — only the `@generated` *.v1.rs files.
+  - "crates/headwaters-proto/src/proto/*.v1.rs"
+  # Every file under connect_gen/ is `@generated` (connectrpc service stubs).
+  - "crates/headwaters-proto/src/connect_gen/**"
+  # Process entry point: pure runtime wiring (pool, server, signal handling) that
+  # in-process integration tests don't drive — counting it only depresses the
+  # honest number, same rationale as the generated code above.
+  - "crates/headwaters/src/main.rs"
+  # A documented contract trait with no direct callers (the Postgres applier
+  # bypasses it; see the module docs), so there is nothing to exercise.
+  - "crates/headwaters/src/projection/applier.rs"
+  - "**/examples/**" # runnable examples, not unit-tested
+  - "**/tests/**" # integration test harnesses
+  - "**/benches/**"
+
+# Public-repo tokenless upload; no CODECOV_TOKEN secret required.
+codecov:
+  require_ci_to_pass: false
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default

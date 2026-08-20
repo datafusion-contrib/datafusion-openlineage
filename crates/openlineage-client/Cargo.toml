@@ -1,0 +1,32 @@
+[package]
+name = "openlineage-client"
+version = "0.0.4"
+description = "Transport-agnostic OpenLineage event model and emit client"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository = "https://github.com/datafusion-contrib/datafusion-openlineage"
+homepage = "https://github.com/open-lakehouse/headwaters/tree/main/crates/openlineage-client"
+documentation = "https://docs.rs/openlineage-client"
+readme = "README.md"
+keywords = ["openlineage", "lineage", "observability", "client"]
+categories = ["database"]
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["v7", "serde"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+olai-http = { workspace = true, optional = true }
+
+[features]
+default = ["http"]
+http = ["dep:olai-http"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
