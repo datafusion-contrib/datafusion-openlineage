@@ -20,14 +20,12 @@ async-trait = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
-# OpenLineage recommends time-ordered (v7) UUIDs for run ids.
 uuid = { workspace = true, features = ["v7", "serde"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [features]
 default = ["http"]
-# Forwards to openlineage-client's HTTP transport (CloudClientTransport).
 http = ["openlineage-client/http"]
 # Opt-in: the live Marquez reference-backend acceptance test (tests/marquez_acceptance.rs).
 # It additionally needs Docker; the test is also `#[ignore]`d so even with the
