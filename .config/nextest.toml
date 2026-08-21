@@ -1,0 +1,15 @@
+# Nextest configuration. The `ci` profile is used by the GitHub Actions `test`
+# job (see .github/workflows/ci.yml) and is what makes test results visible even
+# when other checks (clippy/fmt) fail.
+[profile.ci]
+# Surface flakiness as failures rather than masking it with reruns.
+retries = 0
+# Run every test and report each failure instead of stopping at the first — the
+# whole point is to always hand back a complete picture of what passed/failed.
+fail-fast = false
+# Quieter status line; the JUnit report + GitHub test reporter carry the detail.
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+# Emitted to target/nextest/ci/junit.xml; consumed by dorny/test-reporter.
+path = "junit.xml"
