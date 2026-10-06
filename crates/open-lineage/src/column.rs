@@ -25,9 +25,8 @@ use datafusion::logical_expr::{
     CreateMemoryTable, CreateView, DdlStatement, Distinct, Expr, JoinType, LogicalPlan, WriteOp,
 };
 
-use crate::config::OpenLineageConfig;
-use crate::extract::dataset_for;
 use crate::naming::DatasetName;
+use crate::resolver::{DatasetAccess, DatasetNames, is_information_schema};
 
 /// A physical source column in a real input dataset.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -156,7 +155,7 @@ pub struct ResolvedColumns {
 /// Resolve the column lineage of the dataset written by `plan`.
 pub(crate) fn resolve_output_columns(
     plan: &LogicalPlan,
-    config: &OpenLineageConfig,
+    names: &DatasetNames<'_>,
 ) -> Option<ResolvedColumns> {
     match plan {
         LogicalPlan::Dml(dml) => match dml.op {
@@ -165,7 +164,7 @@ pub(crate) fn resolve_output_columns(
             // key the resolved map by the target's field names. Degrade on
             // arity mismatch — non-SQL plan builders carry no such guarantee.
             WriteOp::Insert(_) | WriteOp::Ctas | WriteOp::Update => {
-                let resolved = resolve(&dml.input, config)?;
+                let resolved = resolve(&dml.input, names)?;
                 let target = dml.target.schema();
                 if resolved.columns.len() != target.fields().len() {
                     return degrade(plan, "DML input not aligned with target schema");
@@ -182,7 +181,7 @@ pub(crate) fn resolve_output_columns(
             DdlStatement::CreateMemoryTable(CreateMemoryTable { input, .. })
             | DdlStatement::CreateView(CreateView { input, .. }),
         ) => {
-            let resolved = resolve(input, config)?;
+            let resolved = resolve(input, names)?;
             let schema = input.schema().clone();
             if resolved.columns.len() != schema.fields().len() {
                 return degrade(plan, "CTAS/view input arity mismatch");
@@ -234,19 +233,15 @@ fn degrade<T>(plan: &LogicalPlan, reason: &str) -> Option<T> {
 }
 
 /// Bottom-up positional resolution of a relational plan node.
-fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage> {
+fn resolve(plan: &LogicalPlan, names: &DatasetNames<'_>) -> Option<NodeLineage> {
     let node = match plan {
         LogicalPlan::TableScan(scan) => {
             // information_schema is DataFusion's metadata surface, not a real
             // dataset (mirrors the table-level extraction).
-            if scan
-                .table_name
-                .schema()
-                .is_some_and(|s| s.eq_ignore_ascii_case("information_schema"))
-            {
+            if is_information_schema(&scan.table_name) {
                 return degrade(plan, "information_schema scan");
             }
-            let dataset = dataset_for(&scan.table_name, config);
+            let dataset = names.get(&scan.table_name, Some(&scan.source), DatasetAccess::Read);
             let source_schema = scan.source.schema();
             // Map each projected output position back to the *source* schema
             // position, reporting the physical column name.
@@ -286,7 +281,7 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
         }
 
         LogicalPlan::Projection(proj) => {
-            let child = resolve(&proj.input, config)?;
+            let child = resolve(&proj.input, names)?;
             let columns = proj
                 .expr
                 .iter()
@@ -301,17 +296,17 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
         // A positional re-qualification of the input: same columns, new
         // qualifier. The alias name is never consulted, so it cannot
         // fabricate a dataset.
-        LogicalPlan::SubqueryAlias(alias) => resolve(&alias.input, config)?,
+        LogicalPlan::SubqueryAlias(alias) => resolve(&alias.input, names)?,
 
         LogicalPlan::Filter(filter) => {
-            let mut child = resolve(&filter.input, config)?;
+            let mut child = resolve(&filter.input, names)?;
             let sources = referenced_sources(&filter.predicate, &filter.input, &child.columns)?;
             add_indirect(&mut child.indirect, sources, IndirectKind::Filter);
             child
         }
 
         LogicalPlan::Aggregate(agg) => {
-            let child = resolve(&agg.input, config)?;
+            let child = resolve(&agg.input, names)?;
             let group_list = grouping_set_to_exprlist(&agg.group_expr).ok()?;
             let mut columns = Vec::with_capacity(agg.schema.fields().len());
             let mut indirect = child.indirect.clone();
@@ -342,8 +337,8 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
         }
 
         LogicalPlan::Join(join) => {
-            let left = resolve(&join.left, config)?;
-            let right = resolve(&join.right, config)?;
+            let left = resolve(&join.left, names)?;
+            let right = resolve(&join.right, names)?;
             let mut indirect = left.indirect.clone();
             for (source, kinds) in &right.indirect {
                 indirect.entry(source.clone()).or_default().extend(kinds);
@@ -399,7 +394,7 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
             let mut columns = vec![ColumnSources::default(); union.schema.fields().len()];
             let mut indirect = IndirectSources::new();
             for input in &union.inputs {
-                let child = resolve(input, config)?;
+                let child = resolve(input, names)?;
                 if child.columns.len() != columns.len() {
                     return degrade(plan, "union input arity mismatch");
                 }
@@ -414,7 +409,7 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
         }
 
         LogicalPlan::Sort(sort) => {
-            let mut child = resolve(&sort.input, config)?;
+            let mut child = resolve(&sort.input, names)?;
             for sort_expr in &sort.expr {
                 let sources = referenced_sources(&sort_expr.expr, &sort.input, &child.columns)?;
                 add_indirect(&mut child.indirect, sources, IndirectKind::Sort);
@@ -424,12 +419,12 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
 
         // Skip/fetch are literals; row selection by position is not a
         // column-level influence.
-        LogicalPlan::Limit(limit) => resolve(&limit.input, config)?,
-        LogicalPlan::Repartition(repartition) => resolve(&repartition.input, config)?,
+        LogicalPlan::Limit(limit) => resolve(&limit.input, names)?,
+        LogicalPlan::Repartition(repartition) => resolve(&repartition.input, names)?,
 
-        LogicalPlan::Distinct(Distinct::All(input)) => resolve(input, config)?,
+        LogicalPlan::Distinct(Distinct::All(input)) => resolve(input, names)?,
         LogicalPlan::Distinct(Distinct::On(distinct)) => {
-            let child = resolve(&distinct.input, config)?;
+            let child = resolve(&distinct.input, names)?;
             let mut indirect = child.indirect.clone();
             for expr in &distinct.on_expr {
                 let sources = referenced_sources(expr, &distinct.input, &child.columns)?;
@@ -448,7 +443,7 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
         }
 
         LogicalPlan::Window(window) => {
-            let child = resolve(&window.input, config)?;
+            let child = resolve(&window.input, names)?;
             let mut columns = child.columns.clone();
             let mut indirect = child.indirect.clone();
             for expr in &window.window_expr {
@@ -488,7 +483,7 @@ fn resolve(plan: &LogicalPlan, config: &OpenLineageConfig) -> Option<NodeLineage
         }
 
         LogicalPlan::Unnest(unnest) => {
-            let child = resolve(&unnest.input, config)?;
+            let child = resolve(&unnest.input, names)?;
             let unnested: BTreeSet<usize> = unnest
                 .list_type_columns
                 .iter()

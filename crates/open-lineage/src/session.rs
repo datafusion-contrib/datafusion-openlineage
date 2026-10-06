@@ -19,6 +19,7 @@ use openlineage_client::{ClientError, LineageContext, OpenLineageClient, Transpo
 
 use crate::config::{DataFusionConfig, OpenLineageConfig};
 use crate::context::{LineageContextProvider, StaticContextProvider};
+use crate::resolver::DatasetResolver;
 use crate::rule::OpenLineageQueryPlanner;
 
 /// Entry point for instrumenting a DataFusion session with OpenLineage.
@@ -45,6 +46,7 @@ pub struct OpenLineageBuilder {
     transport: Option<Arc<dyn Transport>>,
     context: Option<Arc<dyn LineageContextProvider>>,
     config: Option<OpenLineageConfig>,
+    dataset_resolvers: Vec<Arc<dyn DatasetResolver>>,
 }
 
 impl std::fmt::Debug for OpenLineageBuilder {
@@ -54,6 +56,7 @@ impl std::fmt::Debug for OpenLineageBuilder {
             .field("has_transport", &self.transport.is_some())
             .field("has_context", &self.context.is_some())
             .field("config", &self.config)
+            .field("dataset_resolvers", &self.dataset_resolvers.len())
             .finish()
     }
 }
@@ -115,6 +118,14 @@ impl OpenLineageBuilder {
         self
     }
 
+    /// Append a dataset resolver. Resolvers run in registration order, with the
+    /// first resolved name winning. If none resolves a dataset, its logical
+    /// table reference and the configured job namespace are used.
+    pub fn dataset_resolver(mut self, resolver: Arc<dyn DatasetResolver>) -> Self {
+        self.dataset_resolvers.push(resolver);
+        self
+    }
+
     /// Install the instrumentation on `state`, returning the wired
     /// `SessionState`.
     ///
@@ -140,12 +151,11 @@ impl OpenLineageBuilder {
             .config
             .unwrap_or_else(OpenLineageConfig::for_datafusion);
 
-        let planner = Arc::new(OpenLineageQueryPlanner::new(
-            client,
-            context,
-            config,
-            Vec::new(),
-        ));
+        let mut planner = OpenLineageQueryPlanner::new(client, context, config, Vec::new());
+        for resolver in self.dataset_resolvers {
+            planner = planner.with_dataset_resolver(resolver);
+        }
+        let planner = Arc::new(planner);
         // Also stash the planner as a typed `SessionConfig` extension so the
         // `SessionContext`-level DDL path ([`OpenLineageSqlExt::sql_with_lineage`])
         // can recover it: the `QueryPlanner` trait isn't `Any`, so `query_planner()`

@@ -8,11 +8,12 @@
 //! Column-level lineage is resolved separately by [`crate::column`] (a
 //! positional bottom-up walk) and attached to the output datasets here.
 
+use std::sync::Arc;
+
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::error::Result;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{DdlStatement, LogicalPlan, WriteOp};
-use datafusion::sql::TableReference;
 
 use crate::column::{ResolvedColumns, resolve_output_columns};
 use crate::config::OpenLineageConfig;
@@ -22,6 +23,7 @@ use crate::facets::{
     TransformationType,
 };
 use crate::naming::DatasetName;
+use crate::resolver::{DatasetAccess, DatasetNames, DatasetResolver, is_information_schema};
 
 const SCHEMA_FACET: &str = "1-2-0/SchemaDatasetFacet.json";
 const COLUMN_LINEAGE_FACET: &str = "1-2-0/ColumnLineageDatasetFacet.json";
@@ -67,9 +69,35 @@ pub struct OutputTable {
 }
 
 /// Extract [`QueryLineage`] from an (ideally optimized) logical plan.
+///
+/// Uses the logical table reference under the configured job namespace. Use
+/// [`extract_with_resolvers`] to resolve canonical dataset identities.
 pub fn extract(plan: &LogicalPlan, config: &OpenLineageConfig) -> QueryLineage {
+    extract_with_names(plan, &DatasetNames::new(&config.job_namespace))
+}
+
+/// Extract lineage using an ordered chain of dataset resolvers.
+///
+/// The first resolver to return a name wins; otherwise the naming behavior is
+/// identical to [`extract`]. Identities are resolved once per table reference,
+/// source and access mode within this extraction, then shared by table and column
+/// lineage. Sources are compared by `Arc` identity, not by their logical names.
+///
+/// Hosts with custom query planners can call this directly on their logical plan
+/// when the necessary dataset metadata is available.
+pub async fn extract_with_resolvers(
+    plan: &LogicalPlan,
+    config: &OpenLineageConfig,
+    resolvers: &[Arc<dyn DatasetResolver>],
+) -> QueryLineage {
+    let mut names = DatasetNames::new(&config.job_namespace);
+    names.resolve(plan, resolvers).await;
+    extract_with_names(plan, &names)
+}
+
+fn extract_with_names(plan: &LogicalPlan, names: &DatasetNames<'_>) -> QueryLineage {
     let mut visitor = LineageVisitor {
-        config,
+        names,
         inputs: Vec::new(),
         outputs: Vec::new(),
     };
@@ -78,7 +106,7 @@ pub fn extract(plan: &LogicalPlan, config: &OpenLineageConfig) -> QueryLineage {
 
     let mut outputs = visitor.outputs;
     if !outputs.is_empty()
-        && let Some(resolved) = resolve_output_columns(plan, config)
+        && let Some(resolved) = resolve_output_columns(plan, names)
     {
         // A statement writes (at most) one dataset; the resolved root map
         // describes exactly its fields.
@@ -92,17 +120,6 @@ pub fn extract(plan: &LogicalPlan, config: &OpenLineageConfig) -> QueryLineage {
         outputs,
         sql: None,
     }
-}
-
-/// Map a table reference to its OpenLineage dataset name.
-///
-/// A bare TableScan carries only the qualified reference, not a storage
-/// location. Use the qualified name under the configured namespace; the host
-/// integration can enrich with a physical location + symlinks facet. Shared by
-/// the table-level visitor and the column resolver so the two can never
-/// disagree on dataset identity.
-pub(crate) fn dataset_for(table_ref: &TableReference, config: &OpenLineageConfig) -> DatasetName {
-    DatasetName::from_table_ref(&config.job_namespace, &table_ref.to_string())
 }
 
 /// Map a write op to its `lifecycleStateChange` value, or `None` when the op has
@@ -149,15 +166,9 @@ pub(crate) fn schema_fields(fields: &datafusion::arrow::datatypes::Fields) -> Ve
 }
 
 struct LineageVisitor<'a> {
-    config: &'a OpenLineageConfig,
+    names: &'a DatasetNames<'a>,
     inputs: Vec<InputTable>,
     outputs: Vec<OutputTable>,
-}
-
-impl LineageVisitor<'_> {
-    fn dataset_for(&self, table_ref: &TableReference) -> DatasetName {
-        dataset_for(table_ref, self.config)
-    }
 }
 
 impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
@@ -170,13 +181,11 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
             // as a lineage input only adds noise. Treating these scans as
             // non-inputs is also what lets the planner suppress pure-metadata
             // queries (no inputs + no outputs => no events).
-            LogicalPlan::TableScan(scan)
-                if scan
-                    .table_name
-                    .schema()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("information_schema")) => {}
+            LogicalPlan::TableScan(scan) if is_information_schema(&scan.table_name) => {}
             LogicalPlan::TableScan(scan) => {
-                let dataset = self.dataset_for(&scan.table_name);
+                let dataset =
+                    self.names
+                        .get(&scan.table_name, Some(&scan.source), DatasetAccess::Read);
                 // Report the *full* table schema, not the projected scan schema:
                 // after projection pushdown `SELECT a FROM t` would otherwise
                 // report `t` as having only column `a`, causing the dataset's
@@ -194,7 +203,11 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
             LogicalPlan::Dml(dml) => match dml.op {
                 WriteOp::Insert(_) | WriteOp::Update | WriteOp::Delete | WriteOp::Ctas => {
                     self.outputs.push(OutputTable {
-                        name: self.dataset_for(&dml.table_name),
+                        name: self.names.get(
+                            &dml.table_name,
+                            Some(&dml.target),
+                            DatasetAccess::Write,
+                        ),
                         // The write target's full table schema -> the output's columns.
                         fields: schema_fields(dml.target.schema().fields()),
                         column_lineage: None,
@@ -206,7 +219,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
             LogicalPlan::Ddl(ddl) => match ddl {
                 DdlStatement::CreateExternalTable(cmd) => {
                     self.outputs.push(OutputTable {
-                        name: self.dataset_for(&cmd.name),
+                        name: self.names.get(&cmd.name, None, DatasetAccess::Write),
                         fields: schema_fields(cmd.schema.as_arrow().fields()),
                         column_lineage: None,
                         lifecycle: Some("CREATE"),
@@ -217,7 +230,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                 // inputs, picked up by the TableScan arm).
                 DdlStatement::CreateMemoryTable(cmd) => {
                     self.outputs.push(OutputTable {
-                        name: self.dataset_for(&cmd.name),
+                        name: self.names.get(&cmd.name, None, DatasetAccess::Write),
                         fields: schema_fields(cmd.input.schema().as_arrow().fields()),
                         column_lineage: None,
                         lifecycle: Some("CREATE"),
@@ -229,7 +242,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                 // definition; a plain create is a CREATE.
                 DdlStatement::CreateView(cmd) => {
                     self.outputs.push(OutputTable {
-                        name: self.dataset_for(&cmd.name),
+                        name: self.names.get(&cmd.name, None, DatasetAccess::Write),
                         fields: schema_fields(cmd.input.schema().as_arrow().fields()),
                         column_lineage: None,
                         lifecycle: Some(if cmd.or_replace {

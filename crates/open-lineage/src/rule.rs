@@ -46,7 +46,8 @@ use crate::config::OpenLineageConfig;
 use crate::context::{LineageContext, LineageContextProvider};
 use crate::event::RunEvent;
 use crate::exec::OpenLineageExec;
-use crate::extract::{QueryLineage, extract};
+use crate::extract::{QueryLineage, extract_with_resolvers};
+use crate::resolver::DatasetResolver;
 
 tokio::task_local! {
     /// Set while [`OpenLineageQueryPlanner::execute_ddl_with_lineage`] runs the DDL,
@@ -305,6 +306,22 @@ pub async fn begin_lineage(
     plan: &LogicalPlan,
     session_state: &SessionState,
 ) -> Option<LineageHandle> {
+    begin_lineage_with_resolvers(client, context, config, plan, session_state, &[]).await
+}
+
+/// Like [`begin_lineage`], using an ordered chain of dataset resolvers.
+///
+/// Hosts composing their own query planner can supply the same resolvers used
+/// by [`crate::OpenLineageBuilder::dataset_resolver`]. Resolution happens before
+/// START, and the handle retains those identities for subsequent events.
+pub async fn begin_lineage_with_resolvers(
+    client: &OpenLineageClient,
+    context: &dyn LineageContextProvider,
+    config: &OpenLineageConfig,
+    plan: &LogicalPlan,
+    session_state: &SessionState,
+    resolvers: &[Arc<dyn DatasetResolver>],
+) -> Option<LineageHandle> {
     // A `create_physical_plan` nested inside `execute_ddl_with_lineage` is the
     // DDL body (e.g. the CTAS SELECT that `create_memory_table` collects); the
     // enclosing DDL run already reports it, so emit nothing here.
@@ -312,7 +329,7 @@ pub async fn begin_lineage(
         return None;
     }
 
-    let mut lineage = extract(plan, config);
+    let mut lineage = extract_with_resolvers(plan, config, resolvers).await;
     let cx = context.context(session_state).await;
     // The SQL text isn't recoverable from the plan; take it from the
     // host-supplied context (absent on non-SQL paths, e.g. ingest).
@@ -350,6 +367,7 @@ pub struct OpenLineageQueryPlanner {
     client: OpenLineageClient,
     context: Arc<dyn LineageContextProvider>,
     config: OpenLineageConfig,
+    dataset_resolvers: Vec<Arc<dyn DatasetResolver>>,
     /// Physical planner that knows how to lower [`LineageMarker`]; composes any
     /// extension planners the host already had.
     physical: Arc<DefaultPhysicalPlanner>,
@@ -371,24 +389,33 @@ impl OpenLineageQueryPlanner {
             client,
             context,
             config,
+            dataset_resolvers: Vec::new(),
             physical: Arc::new(DefaultPhysicalPlanner::with_extension_planners(planners)),
         }
     }
 
+    /// Append a resolver, using registration order and the first resolved name.
+    /// An empty chain retains the default logical-table naming behavior.
+    pub fn with_dataset_resolver(mut self, resolver: Arc<dyn DatasetResolver>) -> Self {
+        self.dataset_resolvers.push(resolver);
+        self
+    }
+
     /// Planning-time lineage work shared by the `QueryPlanner` path and the
     /// `SessionContext`-level DDL path (see [`crate::session::OpenLineageSqlExt`]):
-    /// see the free [`begin_lineage`] function this delegates to.
+    /// see the free [`begin_lineage_with_resolvers`] function this delegates to.
     async fn begin_lineage(
         &self,
         plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Option<LineageHandle> {
-        begin_lineage(
+        begin_lineage_with_resolvers(
             &self.client,
             self.context.as_ref(),
             &self.config,
             plan,
             session_state,
+            &self.dataset_resolvers,
         )
         .await
     }
@@ -400,8 +427,8 @@ impl OpenLineageQueryPlanner {
     /// own `create_memory_table` / `create_view` before any `QueryPlanner` sees the
     /// wrapper (it only ever plans the stripped SELECT body), so the planner path
     /// captures the inputs but never the created table as an output. This runs
-    /// [`extract`] on the *full* DDL plan (so the output dataset, its schema, and
-    /// column lineage are captured), emits START, delegates the actual creation to
+    /// [`extract_with_resolvers`] on the *full* DDL plan (capturing the output
+    /// dataset, schema, and column lineage), emits START, delegates creation to
     /// `execute_logical_plan` — reusing DataFusion's registration logic, including
     /// every `if_not_exists` / `or_replace` branch — then emits COMPLETE on success
     /// or FAIL on error, under the same `run_id`.
