@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Pluggable async dataset resolvers, registered in order through the builder,
+  with shared canonical identities for table and column lineage and compatible
+  fallback naming. Custom planners can use `extract_with_resolvers` or
+  `begin_lineage_with_resolvers` directly.
+
 ## [0.0.7](https://github.com/open-lakehouse/headwaters/compare/datafusion-openlineage-v0.0.6...datafusion-openlineage-v0.0.7) - 2026-07-03
 
 ### Added

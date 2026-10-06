@@ -9,7 +9,7 @@ pub use openlineage_client::OpenLineageConfig;
 
 /// The `producer` URI stamped on events emitted by this integration.
 pub const DATAFUSION_PRODUCER: &str =
-    "https://github.com/open-lakehouse/headwaters/datafusion-openlineage";
+    "https://github.com/datafusion-contrib/datafusion-openlineage";
 
 /// Builds [`OpenLineageConfig`] with the DataFusion `processing_engine` identity.
 pub trait DataFusionConfig {
