@@ -19,6 +19,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
 use datafusion_openlineage::builder::start_event;
+use datafusion_openlineage::facets::SymlinkIdentifier;
 use datafusion_openlineage::{
     DatasetAccess, DatasetName, DatasetResolutionContext, DatasetResolver, LineageContext,
     OpenLineage, OpenLineageClient, OpenLineageConfig, OpenLineageSqlExt, QueryLineage,
@@ -32,6 +33,14 @@ fn config() -> OpenLineageConfig {
 
 fn name(table: &str) -> DatasetName {
     DatasetName::from_table_ref("s3://warehouse", table)
+}
+
+fn alias(table: &str) -> SymlinkIdentifier {
+    SymlinkIdentifier {
+        namespace: "catalog://test".into(),
+        name: table.into(),
+        type_: "TABLE".into(),
+    }
 }
 
 fn schema() -> SchemaRef {
@@ -97,6 +106,7 @@ impl TableProvider for StorageTable {
 #[derive(Debug, Default)]
 struct ProviderResolver {
     calls: Mutex<Vec<(TableReference, DatasetAccess, bool)>>,
+    symlink_calls: AtomicUsize,
 }
 
 #[async_trait]
@@ -112,6 +122,18 @@ impl DatasetResolver for ProviderResolver {
         let provider = cx.table_provider()?;
         Some(provider.downcast_ref::<StorageTable>()?.name.clone())
     }
+
+    async fn symlinks(&self, cx: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+        self.symlink_calls.fetch_add(1, Ordering::Relaxed);
+        tokio::task::yield_now().await;
+        let provider = cx.table_provider().unwrap();
+        provider.downcast_ref::<StorageTable>().unwrap();
+        // Repeated aliases must not appear twice in the emitted facet.
+        vec![
+            alias(&cx.table_ref.to_string()),
+            alias(&cx.table_ref.to_string()),
+        ]
+    }
 }
 
 #[derive(Debug, Default)]
@@ -123,6 +145,10 @@ impl DatasetResolver for DecliningResolver {
         self.0.fetch_add(1, Ordering::Relaxed);
         None
     }
+
+    async fn symlinks(&self, _: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+        panic!("a declining resolver must not supply symlinks")
+    }
 }
 
 #[derive(Debug)]
@@ -132,6 +158,10 @@ struct UnexpectedResolver;
 impl DatasetResolver for UnexpectedResolver {
     async fn resolve(&self, _: &DatasetResolutionContext<'_>) -> Option<DatasetName> {
         panic!("resolver after a successful match must not be called")
+    }
+
+    async fn symlinks(&self, _: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+        panic!("resolver after a successful match must not supply symlinks")
     }
 }
 
@@ -209,6 +239,15 @@ async fn builder_resolvers_apply_to_start_complete_fail_and_column_lineage() {
         assert_eq!(event.inputs[0].name, "source");
         assert_eq!(event.outputs[0].namespace, "s3://warehouse");
         assert_eq!(event.outputs[0].name, "destination");
+        for (dataset, table) in [(&event.inputs[0], "src"), (&event.outputs[0], "dst")] {
+            let symlinks = dataset.facets.symlinks.as_ref().unwrap();
+            assert_eq!(symlinks.identifiers, vec![alias(table)]);
+            assert_eq!(symlinks.base.producer, config().producer);
+            assert_eq!(
+                symlinks.base.schema_url,
+                "https://openlineage.io/spec/facets/1-0-1/SymlinksDatasetFacet.json#/$defs/SymlinksDatasetFacet"
+            );
+        }
         let columns = event.outputs[0].facets.column_lineage.as_ref().unwrap();
         for field in columns.fields.values() {
             assert!(!field.input_fields.is_empty());
@@ -230,6 +269,7 @@ async fn builder_resolvers_apply_to_start_complete_fail_and_column_lineage() {
     // and START/terminal events; a new query resolves again.
     assert_eq!(declining.0.load(Ordering::Relaxed), 4);
     assert_eq!(resolver.calls.lock().unwrap().len(), 4);
+    assert_eq!(resolver.symlink_calls.load(Ordering::Relaxed), 4);
 }
 
 #[tokio::test]
@@ -249,6 +289,9 @@ async fn no_match_preserves_existing_events_and_allows_execution() {
             serde_json::json!({"inputs": event.inputs, "outputs": event.outputs})
         };
         assert_eq!(event(&actual), event(&expected));
+        let json = event(&actual);
+        assert!(json["inputs"][0]["facets"].get("symlinks").is_none());
+        assert!(json["outputs"][0]["facets"].get("symlinks").is_none());
     }
     let ctx = ctx.with_lineage(
         OpenLineage::builder()
@@ -326,6 +369,12 @@ async fn source_identity_and_canonical_deduplication_are_independent() {
         );
     }
     assert_eq!(resolver.calls.lock().unwrap().len(), 4);
+    assert_eq!(resolver.symlink_calls.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        lineage.inputs[0].symlinks,
+        vec![alias("t"), alias("other_catalog.schema.t")]
+    );
+    assert_eq!(lineage.inputs[1].symlinks, vec![alias("t")]);
 }
 
 #[derive(Debug)]
@@ -356,6 +405,17 @@ async fn same_source_can_resolve_differently_for_reads_and_writes() {
     let lineage = extract_with_resolvers(&plan, &config(), &[Arc::new(AccessResolver)]).await;
     assert_eq!(lineage.inputs[0].name, name("before"));
     assert_eq!(lineage.outputs[0].name, name("after"));
+    let event = start_event(
+        uuid::Uuid::nil(),
+        &lineage,
+        &LineageContext::default(),
+        &config(),
+    );
+    assert!(
+        event.inputs[0].facets.symlinks.is_none(),
+        "default method opts out"
+    );
+    assert!(event.outputs[0].facets.symlinks.is_none());
     for sources in lineage.outputs[0]
         .column_lineage
         .as_ref()
@@ -382,6 +442,11 @@ impl DatasetResolver for DdlResolver {
         assert!(cx.table_provider().is_none());
         assert_eq!(cx.access, DatasetAccess::Write);
         Some(name(cx.table_ref.table()))
+    }
+
+    async fn symlinks(&self, cx: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+        assert!(cx.source.is_none());
+        vec![alias(cx.table_ref.table())]
     }
 }
 
@@ -414,6 +479,24 @@ async fn ddl_targets_have_no_source_and_share_resolvers_with_inputs() {
             assert_eq!(event.outputs[0].namespace, "s3://warehouse");
             assert_eq!(event.outputs[0].name, "created");
             assert_eq!(event.inputs[0].name, "source");
+            assert_eq!(
+                event.outputs[0]
+                    .facets
+                    .symlinks
+                    .as_ref()
+                    .unwrap()
+                    .identifiers,
+                vec![alias("created")]
+            );
+            assert_eq!(
+                event.inputs[0]
+                    .facets
+                    .symlinks
+                    .as_ref()
+                    .unwrap()
+                    .identifiers,
+                vec![alias("src")]
+            );
             let input = &event.outputs[0]
                 .facets
                 .column_lineage
@@ -437,6 +520,22 @@ async fn ddl_targets_have_no_source_and_share_resolvers_with_inputs() {
     .await;
     let lineage = extract_with_resolvers(&plan, &config(), &[Arc::new(DdlResolver)]).await;
     assert_eq!(lineage.outputs[0].name, name("external_table"));
+    let event = start_event(
+        uuid::Uuid::nil(),
+        &lineage,
+        &LineageContext::default(),
+        &config(),
+    );
+    assert!(event.outputs[0].facets.column_lineage.is_none());
+    assert_eq!(
+        event.outputs[0]
+            .facets
+            .symlinks
+            .as_ref()
+            .unwrap()
+            .identifiers,
+        vec![alias("external_table")]
+    );
 }
 
 struct CustomSource;
@@ -508,9 +607,63 @@ async fn custom_planner_entry_point_retains_resolved_identities() {
         assert_eq!(event.inputs[0].namespace, "s3://warehouse");
         assert_eq!(event.inputs[0].name, "source");
         assert_eq!(
+            event.inputs[0]
+                .facets
+                .symlinks
+                .as_ref()
+                .unwrap()
+                .identifiers,
+            vec![alias("src")]
+        );
+        assert_eq!(
             event.inputs[0].facets.schema.as_ref().unwrap().fields.len(),
             2,
             "projection must not shrink the reported dataset schema"
         );
     }
+}
+
+#[derive(Debug)]
+struct ReadWriteAliases;
+
+#[async_trait]
+impl DatasetResolver for ReadWriteAliases {
+    async fn resolve(&self, _: &DatasetResolutionContext<'_>) -> Option<DatasetName> {
+        Some(name("shared"))
+    }
+
+    async fn symlinks(&self, cx: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+        vec![alias(match cx.access {
+            DatasetAccess::Read => "read_alias",
+            DatasetAccess::Write => "write_alias",
+        })]
+    }
+}
+
+#[tokio::test]
+async fn symlinks_respect_access_mode_and_the_winning_resolver() {
+    let source = provider_as_source(Arc::new(StorageTable::new("table")));
+    let plan = LogicalPlanBuilder::insert_into(
+        scan("table", source.clone()),
+        "table",
+        source,
+        InsertOp::Append,
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    let lineage = extract_with_resolvers(&plan, &config(), &[Arc::new(ReadWriteAliases)]).await;
+    assert_eq!(lineage.inputs[0].name, lineage.outputs[0].name);
+    assert_eq!(lineage.inputs[0].symlinks, vec![alias("read_alias")]);
+    assert_eq!(lineage.outputs[0].symlinks, vec![alias("write_alias")]);
+
+    // A winner using the default empty method still ends the resolver chain.
+    let lineage = extract_with_resolvers(
+        &plan,
+        &config(),
+        &[Arc::new(AccessResolver), Arc::new(UnexpectedResolver)],
+    )
+    .await;
+    assert!(lineage.inputs[0].symlinks.is_empty());
+    assert!(lineage.outputs[0].symlinks.is_empty());
 }

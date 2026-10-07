@@ -43,6 +43,7 @@ const DATA_SOURCE_FACET: &str =
     include_str!("schemas/openlineage/facets/DatasourceDatasetFacet.json");
 const LIFECYCLE_FACET: &str =
     include_str!("schemas/openlineage/facets/LifecycleStateChangeDatasetFacet.json");
+const SYMLINKS_FACET: &str = include_str!("schemas/openlineage/facets/SymlinksDatasetFacet.json");
 
 /// The vendored core schema, registered under the retrieval URI the facet
 /// schemas `$ref`. Built once; owned `Value` contents make it `'static`.
@@ -363,6 +364,71 @@ async fn schema_facet_conforms() {
         }
     }
     assert!(checked, "a schema facet was emitted and validated");
+}
+
+#[tokio::test]
+async fn resolver_symlinks_facet_conforms() {
+    use datafusion_openlineage::builder::start_event;
+    use datafusion_openlineage::facets::SymlinkIdentifier;
+    use datafusion_openlineage::{
+        DatasetName, DatasetResolutionContext, DatasetResolver, LineageContext,
+        extract_with_resolvers,
+    };
+
+    #[derive(Debug)]
+    struct CatalogResolver;
+
+    #[async_trait::async_trait]
+    impl DatasetResolver for CatalogResolver {
+        async fn resolve(&self, cx: &DatasetResolutionContext<'_>) -> Option<DatasetName> {
+            Some(DatasetName::from_table_ref(
+                "s3://warehouse",
+                cx.table_ref.table(),
+            ))
+        }
+
+        async fn symlinks(&self, cx: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+            vec![SymlinkIdentifier {
+                namespace: "catalog://warehouse".into(),
+                name: cx.table_ref.to_string(),
+                type_: "TABLE".into(),
+            }]
+        }
+    }
+
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE TABLE src AS VALUES (1)",
+        "CREATE TABLE dst AS VALUES (2)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    let state = ctx.state();
+    let plan = state
+        .create_logical_plan("INSERT INTO dst SELECT * FROM src")
+        .await
+        .unwrap();
+    let plan = state.optimize(&plan).unwrap();
+    let cfg = config();
+    let lineage = extract_with_resolvers(&plan, &cfg, &[Arc::new(CatalogResolver)]).await;
+    let event = start_event(
+        uuid::Uuid::nil(),
+        &lineage,
+        &LineageContext::default(),
+        &cfg,
+    );
+    assert_valid(
+        core_validator(),
+        &serde_json::to_value(&event).unwrap(),
+        "resolver event",
+    );
+    assert_eq!((event.inputs.len(), event.outputs.len()), (1, 1));
+    let validator = validator_for(SYMLINKS_FACET);
+    for dataset in event.inputs.iter().chain(&event.outputs) {
+        let body = serde_json::to_value(dataset.facets.symlinks.as_ref().unwrap()).unwrap();
+        assert_valid(&validator, &wrapped("symlinks", &body), "symlinks facet");
+        assert_eq!(body["identifiers"][0]["type"], "TABLE");
+    }
 }
 
 // Reference the input-statistics schema constant so an accidental rename of the

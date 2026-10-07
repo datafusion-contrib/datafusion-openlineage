@@ -10,6 +10,7 @@ use datafusion::logical_expr::{DdlStatement, LogicalPlan, TableSource, WriteOp};
 use datafusion::sql::TableReference;
 
 use crate::DatasetName;
+use crate::facets::SymlinkIdentifier;
 
 /// Whether a logical-plan node reads or writes a dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +58,21 @@ impl DatasetResolutionContext<'_> {
 pub trait DatasetResolver: Debug + Send + Sync {
     /// Return a canonical name, or `None` to try the next resolver.
     async fn resolve(&self, context: &DatasetResolutionContext<'_>) -> Option<DatasetName>;
+
+    /// Return alternate identifiers for the dataset resolved by this resolver.
+    ///
+    /// Called only after this resolver returns `Some` from [`Self::resolve`],
+    /// with the same context, once per distinct request within an extraction.
+    /// The default returns no symlinks. Return an empty vector when unavailable;
+    /// any metadata I/O must be bounded just as for [`Self::resolve`].
+    ///
+    /// Nonempty results become the `symlinks` dataset facet. Aliases from
+    /// requests with the same canonical identity and access mode are merged,
+    /// removing duplicate namespace/name/type triples. They do not change the
+    /// canonical identity used by dataset or column lineage.
+    async fn symlinks(&self, _context: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+        Vec::new()
+    }
 }
 
 struct DatasetRequest {
@@ -108,11 +124,16 @@ impl DatasetRequest {
     }
 }
 
+struct ResolvedDataset {
+    name: DatasetName,
+    symlinks: Vec<SymlinkIdentifier>,
+}
+
 /// A query-local lookup shared by table and column extraction. Source identity
 /// matters: unrelated scans can carry the same logical table reference.
 pub(crate) struct DatasetNames<'a> {
     default_namespace: &'a str,
-    resolved: Vec<(DatasetRequest, DatasetName)>,
+    resolved: Vec<(DatasetRequest, ResolvedDataset)>,
 }
 
 impl<'a> DatasetNames<'a> {
@@ -153,16 +174,19 @@ impl<'a> DatasetNames<'a> {
                 default_namespace: self.default_namespace,
             };
             let mut name = None;
+            let mut symlinks = Vec::new();
             for resolver in resolvers {
                 name = resolver.resolve(&context).await;
                 if name.is_some() {
+                    symlinks = resolver.symlinks(&context).await;
                     break;
                 }
             }
             let name = name.unwrap_or_else(|| {
                 DatasetName::from_table_ref(self.default_namespace, &request.table_ref.to_string())
             });
-            self.resolved.push((request, name));
+            self.resolved
+                .push((request, ResolvedDataset { name, symlinks }));
         }
     }
 
@@ -175,10 +199,28 @@ impl<'a> DatasetNames<'a> {
         self.resolved
             .iter()
             .find(|(request, _)| request.matches(table_ref, source, access))
-            .map(|(_, name)| name.clone())
+            .map(|(_, dataset)| dataset.name.clone())
             .unwrap_or_else(|| {
                 DatasetName::from_table_ref(self.default_namespace, &table_ref.to_string())
             })
+    }
+
+    pub(crate) fn symlinks(
+        &self,
+        name: &DatasetName,
+        access: DatasetAccess,
+    ) -> Vec<SymlinkIdentifier> {
+        let mut symlinks = Vec::new();
+        for (request, dataset) in &self.resolved {
+            if request.access == access && dataset.name == *name {
+                for alias in &dataset.symlinks {
+                    if !symlinks.contains(alias) {
+                        symlinks.push(alias.clone());
+                    }
+                }
+            }
+        }
+        symlinks
     }
 }
 

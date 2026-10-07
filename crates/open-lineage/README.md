@@ -63,6 +63,7 @@ use datafusion_openlineage::{
     DatasetName, DatasetResolutionContext, DatasetResolver, OpenLineage,
     OpenLineageSqlExt,
 };
+use datafusion_openlineage::facets::SymlinkIdentifier;
 
 // This example uses metadata supplied by the host. A resolver can also inspect
 // context.source or downcast context.table_provider() to a provider it knows.
@@ -73,6 +74,15 @@ struct KnownDatasets(HashMap<TableReference, DatasetName>);
 impl DatasetResolver for KnownDatasets {
     async fn resolve(&self, context: &DatasetResolutionContext<'_>) -> Option<DatasetName> {
         self.0.get(context.table_ref).cloned()
+    }
+
+    // Optional: the default implementation returns an empty vector.
+    async fn symlinks(&self, context: &DatasetResolutionContext<'_>) -> Vec<SymlinkIdentifier> {
+        vec![SymlinkIdentifier {
+            namespace: "catalog://warehouse".into(),
+            name: context.table_ref.to_string(),
+            type_: "TABLE".into(),
+        }]
     }
 }
 
@@ -100,6 +110,13 @@ order; the first `Some(DatasetName)` wins. `None` tries the next resolver, and i
 none matches, the existing naming behavior is preserved. The job namespace and
 job name are unaffected.
 
+Only the winning resolver's `symlinks` method is called, with the same context.
+A nonempty vector adds the standard `symlinks` facet to that input or output
+dataset; an empty vector omits the facet and does not try another resolver.
+Aliases are optional and never replace the canonical identity used by column
+lineage. When multiple references resolve to the same dataset within an access
+mode, their aliases are merged and duplicate namespace/name/type triples removed.
+
 The context includes the logical table reference, optional `TableSource`,
 `DatasetAccess::Read` or `Write`, and the fallback namespace. Scans provide their
 source; DML writes provide their target; DDL targets have no source. The
@@ -108,13 +125,15 @@ source; DML writes provide their target; DDL targets have no source. The
 
 Resolvers may await metadata I/O. Keep lookups bounded, log lookup failures, and
 return `None` when identity is unavailable. Resolvers should not prepare or
-execute writes. They resolve identities only; this API does not supply dataset
-facets or refresh identities after execution. The existing synthetic `dataSource`
+execute writes. For unavailable aliases, `symlinks` should return an empty vector.
+This API supplies identities and symlinks; it does not supply arbitrary dataset
+facets or refresh metadata after execution. The existing synthetic `dataSource`
 facet remains unchanged.
 
 Resolution runs before START. Each distinct table reference/source/access
 combination is resolved once per extraction and shared by table and column
-lineage. The run retains those names for COMPLETE or FAIL. Metadata-only scans
+lineage. Symlinks are fetched once for each successful resolution. The run retains
+both names and symlinks for COMPLETE or FAIL. Metadata-only scans
 of `information_schema` remain excluded.
 
 For hosts with custom planners, `extract_with_resolvers(plan, config, resolvers)`

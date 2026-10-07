@@ -410,7 +410,7 @@ pub struct SymlinksDatasetFacet {
 }
 
 /// One alternate identifier of a [`SymlinksDatasetFacet`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymlinkIdentifier {
     /// Namespace of the alternate identifier.
     pub namespace: String,

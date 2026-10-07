@@ -19,8 +19,8 @@ use crate::column::{ResolvedColumns, resolve_output_columns};
 use crate::config::OpenLineageConfig;
 use crate::facets::{
     BaseFacet, ColumnLineageDatasetFacet, DataSourceDatasetFacet, DatasetFacets, FieldLineage,
-    InputField, LifecycleStateChangeDatasetFacet, SchemaDatasetFacet, SchemaField, Transformation,
-    TransformationType,
+    InputField, LifecycleStateChangeDatasetFacet, SchemaDatasetFacet, SchemaField,
+    SymlinkIdentifier, SymlinksDatasetFacet, Transformation, TransformationType,
 };
 use crate::naming::DatasetName;
 use crate::resolver::{DatasetAccess, DatasetNames, DatasetResolver, is_information_schema};
@@ -29,6 +29,7 @@ const SCHEMA_FACET: &str = "1-2-0/SchemaDatasetFacet.json";
 const COLUMN_LINEAGE_FACET: &str = "1-2-0/ColumnLineageDatasetFacet.json";
 const DATA_SOURCE_FACET: &str = "1-0-1/DatasourceDatasetFacet.json";
 const LIFECYCLE_FACET: &str = "1-0-1/LifecycleStateChangeDatasetFacet.json";
+const SYMLINKS_FACET: &str = "1-0-1/SymlinksDatasetFacet.json#/$defs/SymlinksDatasetFacet";
 
 /// What a query reads and writes.
 #[derive(Debug, Default)]
@@ -49,6 +50,8 @@ pub struct InputTable {
     pub name: DatasetName,
     /// The dataset's full table schema (not the projected scan schema).
     pub fields: Vec<SchemaField>,
+    /// Alternate identifiers supplied by the dataset resolver.
+    pub symlinks: Vec<SymlinkIdentifier>,
 }
 
 /// A dataset a query writes, with its schema and optional column lineage.
@@ -66,6 +69,8 @@ pub struct OutputTable {
     /// the write op maps cleanly to a spec enum value. `None` for plain appends,
     /// updates, and deletes, which have no corresponding state-change value.
     pub lifecycle: Option<&'static str>,
+    /// Alternate identifiers supplied by the dataset resolver.
+    pub symlinks: Vec<SymlinkIdentifier>,
 }
 
 /// Extract [`QueryLineage`] from an (ideally optimized) logical plan.
@@ -82,6 +87,9 @@ pub fn extract(plan: &LogicalPlan, config: &OpenLineageConfig) -> QueryLineage {
 /// identical to [`extract`]. Identities are resolved once per table reference,
 /// source and access mode within this extraction, then shared by table and column
 /// lineage. Sources are compared by `Arc` identity, not by their logical names.
+/// The winning resolver also supplies optional symlinks, retained alongside the
+/// canonical identity. Duplicate aliases for the same dataset and access mode
+/// are merged.
 ///
 /// Hosts with custom query planners can call this directly on their logical plan
 /// when the necessary dataset metadata is available.
@@ -104,7 +112,13 @@ fn extract_with_names(plan: &LogicalPlan, names: &DatasetNames<'_>) -> QueryLine
     // The visitor never returns an error; ignore the traversal Result.
     let _ = plan.visit(&mut visitor);
 
+    for input in &mut visitor.inputs {
+        input.symlinks = names.symlinks(&input.name, DatasetAccess::Read);
+    }
     let mut outputs = visitor.outputs;
+    for output in &mut outputs {
+        output.symlinks = names.symlinks(&output.name, DatasetAccess::Write);
+    }
     if !outputs.is_empty()
         && let Some(resolved) = resolve_output_columns(plan, names)
     {
@@ -197,6 +211,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                     self.inputs.push(InputTable {
                         name: dataset,
                         fields,
+                        symlinks: Vec::new(),
                     });
                 }
             }
@@ -212,6 +227,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                         fields: schema_fields(dml.target.schema().fields()),
                         column_lineage: None,
                         lifecycle: lifecycle_for(&dml.op),
+                        symlinks: Vec::new(),
                     });
                 }
                 WriteOp::Truncate => {}
@@ -223,6 +239,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                         fields: schema_fields(cmd.schema.as_arrow().fields()),
                         column_lineage: None,
                         lifecycle: Some("CREATE"),
+                        symlinks: Vec::new(),
                     });
                 }
                 // `CREATE TABLE ... AS SELECT` lowers to CreateMemoryTable; the
@@ -234,6 +251,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                         fields: schema_fields(cmd.input.schema().as_arrow().fields()),
                         column_lineage: None,
                         lifecycle: Some("CREATE"),
+                        symlinks: Vec::new(),
                     });
                 }
                 // `CREATE VIEW v AS SELECT ...` defines a derived dataset: the
@@ -250,6 +268,7 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                         } else {
                             "CREATE"
                         }),
+                        symlinks: Vec::new(),
                     });
                 }
                 _ => {}
@@ -268,7 +287,17 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
     }
 }
 
-/// Build the [`DatasetFacets`] for an input table: its schema facet.
+fn symlinks_facet(
+    identifiers: &[SymlinkIdentifier],
+    config: &OpenLineageConfig,
+) -> Option<SymlinksDatasetFacet> {
+    (!identifiers.is_empty()).then(|| SymlinksDatasetFacet {
+        base: BaseFacet::new(&config.producer, SYMLINKS_FACET),
+        identifiers: identifiers.to_vec(),
+    })
+}
+
+/// Build the [`DatasetFacets`] for an input table.
 ///
 /// Column lineage never appears on inputs — the spec defines the facet on
 /// output datasets, keyed by output field.
@@ -284,6 +313,7 @@ pub(crate) fn input_dataset_facets(
     DatasetFacets {
         schema: Some(schema),
         data_source: Some(data_source_facet(&input.name, config)),
+        symlinks: symlinks_facet(&input.symlinks, config),
         ..Default::default()
     }
 }
@@ -309,6 +339,7 @@ pub(crate) fn output_dataset_facets(
     // dataSource + lifecycleStateChange ride along on every output regardless of
     // whether column lineage resolved, so build them once.
     let data_source = Some(data_source_facet(&output.name, config));
+    let symlinks = symlinks_facet(&output.symlinks, config);
     let lifecycle_state_change = output
         .lifecycle
         .map(|state| LifecycleStateChangeDatasetFacet {
@@ -326,6 +357,7 @@ pub(crate) fn output_dataset_facets(
                 schema,
                 data_source,
                 lifecycle_state_change,
+                symlinks,
                 ..Default::default()
             };
         }
@@ -386,6 +418,7 @@ pub(crate) fn output_dataset_facets(
         schema,
         data_source,
         lifecycle_state_change,
+        symlinks,
         column_lineage: Some(ColumnLineageDatasetFacet {
             base: BaseFacet::new(&config.producer, COLUMN_LINEAGE_FACET),
             fields,
