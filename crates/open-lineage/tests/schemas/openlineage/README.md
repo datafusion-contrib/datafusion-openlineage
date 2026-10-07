@@ -43,6 +43,7 @@ advertise — not a newer or older approximation.
 | SchemaDatasetFacet                   | 1-2-0                       |
 | DatasourceDatasetFacet               | 1-0-1                       |
 | LifecycleStateChangeDatasetFacet     | 1-0-1                       |
+| SymlinksDatasetFacet                 | 1-0-1                       |
 
 If a future spec release advances any of these, bump the emitted constant in the
 source **and** re-vendor the schema here in the same change, so the two never
