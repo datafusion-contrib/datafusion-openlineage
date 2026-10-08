@@ -42,6 +42,9 @@ jobs:
         uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
         with:
           command: release-pr
+          # Respect release tag boundaries before inspecting historical manifests.
+          # The action defaults to 0.3.159, which still inspects the import commit.
+          version: "0.3.170"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -71,5 +74,6 @@ jobs:
         uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
         with:
           command: release
+          version: "0.3.170"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
