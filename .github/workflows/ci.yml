@@ -34,8 +34,6 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
-      proto: ${{ steps.filter.outputs.proto }}
-      ui: ${{ steps.filter.outputs.ui }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -47,8 +45,6 @@ jobs:
           # `code` is true when ANY changed path is NOT one of these docs/meta
           # patterns (negations are anchored at the repo root). Keep this list in
           # sync with the set of files that genuinely can't affect the build.
-          # `proto` gates the codegen-staleness check on changes to the .proto
-          # sources, the buf config, or the committed generated output.
           filters: |
             code:
               - '!**/*.md'
@@ -56,16 +52,6 @@ jobs:
               - '!LICENSE'
               - '!.gitignore'
               - '!.editorconfig'
-            proto:
-              - 'proto/**'
-              - 'buf.yaml'
-              - 'buf.gen.yaml'
-              - 'buf.lock'
-              - 'crates/headwaters/src/proto/**'
-              - 'crates/headwaters/src/connect_gen/**'
-            ui:
-              - 'node/**'
-              - 'crates/headwaters/ui.lock'
 
   # fmt, clippy, test and coverage are independent jobs that run in parallel.
   # Splitting them (rather than one sequential job) means a clippy or fmt failure
@@ -84,7 +70,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # fmt only parses source, so it needs no protoc and no build cache —
+      # fmt only parses source, so it needs no build cache —
       # keep this job seconds-fast for the quickest possible style feedback.
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
@@ -131,16 +117,6 @@ jobs:
           toolchain: "1.96"
           components: clippy
 
-      # cedar-policy's build script compiles .proto schemas via prost-build,
-      # which shells out to `protoc`. Pin both the action (by commit SHA) and
-      # the protoc version so the toolchain is reproducible; repo-token avoids
-      # the unauthenticated GitHub API rate limit when resolving the release.
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "31.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       # Caches ~/.cargo and ./target keyed on the lockfile. clippy and test share
       # the "ci" shared-key so they reuse one warmed target/; only main writes the
       # cache (save-if) so parallel PR jobs don't thrash each other's entry.
@@ -149,8 +125,7 @@ jobs:
           shared-key: ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The same gate enforced locally: deny all warnings across every target and
-      # feature (incl. `governance` and the opt-in `tpcds` bench scaffolding).
+      # Deny warnings across every target and feature.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -177,12 +152,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: "1.91"
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "31.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
@@ -215,12 +184,6 @@ jobs:
         with:
           toolchain: "1.96"
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "31.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
           shared-key: ci
@@ -231,10 +194,9 @@ jobs:
         with:
           tool: cargo-nextest
 
-      # Live-integration tests (UC / OCI registry / a running hydrofoil) are
-      # marked #[ignore], so the default run needs no services. The always-on
-      # OpenLineage spec-conformance suite (tests/conformance.rs) runs here too —
-      # it validates emitted events against vendored JSON Schemas, no services.
+      # Live Marquez tests are marked #[ignore], so the default run needs no
+      # services. The OpenLineage spec-conformance suite (tests/conformance.rs)
+      # validates emitted events against vendored JSON Schemas here too.
       # --profile ci writes target/nextest/ci/junit.xml and runs every test
       # (fail-fast = false) so the report is complete even on failure.
       - name: Test
@@ -295,12 +257,6 @@ jobs:
           toolchain: "1.96"
           components: llvm-tools-preview
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "31.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       # Coverage recompiles with -C instrument-coverage, so it cannot reuse the
       # test/clippy "ci" cache — give it its own shared-key.
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
@@ -315,28 +271,14 @@ jobs:
       # Collect coverage from both nextest tests and doctests into one report.
       # Doctest coverage needs nightly (unstable `--persist-doctests`); the
       # nextest run stays on the pinned stable toolchain.
-      #
-      # `--ignore-filename-regex` drops code we never want counted from the report
-      # itself, so `codecov.json` never carries it:
-      #   * committed codegen — the buffa-generated proto message types
-      #     `src/proto/*.v1.rs` and the connectrpc stubs under `src/connect_gen/`
-      #     (the hand-written `src/proto/mod.rs` is deliberately NOT matched);
-      #   * `src/main.rs` — process entry-point wiring no in-process test drives;
-      #   * `src/projection/applier.rs` — a contract trait with no direct callers.
-      # codecov.yml's `ignore` does the same server-side; filtering at the source
-      # keeps the uploaded artifact honest too. Keep the two in sync.
       - name: Collect coverage
         run: |
           cargo llvm-cov --no-report nextest --workspace --all-features
           cargo +nightly llvm-cov --no-report --doc --workspace --all-features
-          cargo +nightly llvm-cov report --doctests --codecov --output-path codecov.json \
-            --ignore-filename-regex 'headwaters/src/(proto/[^/]+\.v1\.rs|connect_gen/|main\.rs|projection/applier\.rs)'
+          cargo +nightly llvm-cov report --doctests --codecov --output-path codecov.json
 
-      # Codecov rejects tokenless uploads for this repo
-      # ("Token required - not valid tokenless upload"), so authenticate with
-      # the repository upload token stored as the CODECOV_TOKEN secret. Never
-      # fails CI on a flaky upload, and codecov.yml keeps the status
-      # informational so it can't block a PR.
+      # Upload coverage using the repository's Codecov credentials when present.
+      # Upload failures do not fail this job.
       - name: Upload to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
@@ -368,12 +310,6 @@ jobs:
         with:
           toolchain: "1.96"
 
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
-        with:
-          version: "31.1"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
 
       # ubuntu-latest ships a working Docker daemon; testcontainers finds it at
@@ -389,7 +325,7 @@ jobs:
   ci:
     name: ci
     if: ${{ always() }}
-    needs: [fmt, machete, clippy, msrv, proto-check, ui-fingerprint, test, coverage]
+    needs: [fmt, machete, clippy, msrv, test, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
@@ -404,8 +340,6 @@ jobs:
             "machete:${{ needs.machete.result }}" \
             "clippy:${{ needs.clippy.result }}" \
             "msrv:${{ needs.msrv.result }}" \
-            "proto-check:${{ needs.proto-check.result }}" \
-            "ui-fingerprint:${{ needs.ui-fingerprint.result }}" \
             "test:${{ needs.test.result }}" \
             "coverage:${{ needs.coverage.result }}"; do
             name="${r%%:*}"; result="${r##*:}"
