@@ -242,19 +242,12 @@ jobs:
 
       # Doctest coverage (`--doc` / `report --doctests`) relies on
       # `-Z unstable-options --persist-doctests`, which only the nightly
-      # compiler accepts. Install nightly so the doctest coverage step can run
-      # via `cargo +nightly`. Stable is installed last below so it stays the
-      # default toolchain for the nextest run.
+      # compiler accepts. Use the same nightly for all coverage collection and
+      # reporting: stable and nightly can use incompatible LLVM profile formats.
+      # llvm-tools-preview supplies the matching LLVM coverage tools.
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: nightly
-          components: llvm-tools-preview
-
-      # llvm-tools-preview ships the profdata tooling cargo-llvm-cov needs.
-      # Installed after nightly so "1.96" remains the default toolchain.
-      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          toolchain: "1.96"
           components: llvm-tools-preview
 
       # Coverage recompiles with -C instrument-coverage, so it cannot reuse the
@@ -269,11 +262,12 @@ jobs:
           tool: cargo-llvm-cov,cargo-nextest
 
       # Collect coverage from both nextest tests and doctests into one report.
-      # Doctest coverage needs nightly (unstable `--persist-doctests`); the
-      # nextest run stays on the pinned stable toolchain.
+      # --no-report retains existing artifacts, so clean once before collecting
+      # either set of profiles to avoid merging stale data from earlier runs.
       - name: Collect coverage
         run: |
-          cargo llvm-cov --no-report nextest --workspace --all-features
+          cargo +nightly llvm-cov clean --workspace
+          cargo +nightly llvm-cov --no-report nextest --workspace --all-features
           cargo +nightly llvm-cov --no-report --doc --workspace --all-features
           cargo +nightly llvm-cov report --doctests --codecov --output-path codecov.json
 
