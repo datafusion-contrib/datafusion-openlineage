@@ -1,0 +1,90 @@
+name: API compatibility
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: api-compatibility-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: API compatibility (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # This report is advisory, including failures to build or run the checker.
+    # Keep it out of the required `ci` job in ci.yml.
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      # Prepare an inconclusive report first, so setup failures can be reported too.
+      - name: Initialize report
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          pr = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())['pull_request']
+          directory = Path(os.environ['RUNNER_TEMP']) / 'api-compatibility'
+          directory.mkdir()
+          (directory / 'report.json').write_text(json.dumps({
+              'number': pr['number'], 'head': pr['head']['sha'], 'base': pr['base']['sha'],
+              'exit_code': None, 'output': 'The check did not complete. See the workflow logs.',
+          }))
+          PY
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Use GitHub's PR merge commit, so an out-of-date branch does not
+          # appear to remove APIs that were added to main since it branched.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.96"
+
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-semver-checks@0.51.0
+
+      - name: Compare public APIs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CARGO_TERM_COLOR: never
+        run: |
+          report_dir="$RUNNER_TEMP/api-compatibility"
+          # Force a minor release comparison so a version bump in the PR cannot
+          # hide breaking changes. The PR report does not choose release versions.
+          status=0
+          timeout 25m cargo semver-checks --workspace --all-features \
+            --baseline-rev "$BASE_SHA" --release-type minor --color never \
+            > "$report_dir/output.txt" 2>&1 || status=$?
+          printf '%s\n' "$status" > "$report_dir/exit-code.txt"
+          cat "$report_dir/output.txt"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          directory = Path(os.environ['RUNNER_TEMP']) / 'api-compatibility'
+          path = directory / 'report.json'
+          report = json.loads(path.read_text())
+          output = (directory / 'output.txt').read_text(errors='replace')
+          if len(output) > 20000:
+              output = '[Output truncated; see workflow logs for the full report.]\n' + output[-20000:]
+          report.update(exit_code=int((directory / 'exit-code.txt').read_text()), output=output)
+          path.write_text(json.dumps(report))
+          PY
+
+      # The separate workflow_run reporter has comment permission. This job
+      # builds untrusted PR code (including forks) with read-only permissions.
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-compatibility-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/api-compatibility/report.json
+          retention-days: 7
+          if-no-files-found: warn
