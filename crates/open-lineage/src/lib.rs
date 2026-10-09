@@ -41,6 +41,7 @@ pub mod config;
 pub mod context;
 pub mod exec;
 pub mod extract;
+pub mod facet;
 pub mod resolver;
 pub mod rule;
 pub mod session;
@@ -60,10 +61,13 @@ pub use config::DataFusionConfig;
 pub use context::{LineageContextProvider, StaticContextProvider};
 pub use exec::OpenLineageExec;
 pub use extract::{QueryLineage, extract, extract_with_resolvers};
-pub use resolver::{DatasetAccess, DatasetResolutionContext, DatasetResolver};
+pub use facet::{FacetBuilderFactory, FacetRegistry};
+pub use resolver::{
+    DatasetAccess, DatasetOrigin, DatasetResolutionContext, DatasetResolver, ResolvedDataset,
+};
 pub use rule::{
     LineageExtensionPlanner, LineageHandle, LineageMarker, OpenLineageQueryPlanner, begin_lineage,
-    begin_lineage_with_resolvers,
+    begin_lineage_with_facets, begin_lineage_with_resolvers,
 };
 pub use session::{
     OpenLineage, OpenLineageBuilder, OpenLineageSqlExt, instrument_session_state,

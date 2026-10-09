@@ -19,6 +19,8 @@ column-level lineage.
   mid-stream reports `FAIL`, not `COMPLETE`).
 - **Runtime statistics** — rows/bytes read and written, harvested from DataFusion
   metrics and attached to the terminal event.
+- **Typed facet extensions** — query-scoped factories and builders for job, run,
+  dataset, input, and output facets, including automatic built-in registration.
 - **Non-blocking emission** — events go through a bounded queue drained by a
   background task; lineage never stalls or fails a query.
 
@@ -126,9 +128,9 @@ source; DML writes provide their target; DDL targets have no source. The
 Resolvers may await metadata I/O. Keep lookups bounded, log lookup failures, and
 return `None` when identity is unavailable. Resolvers should not prepare or
 execute writes. For unavailable aliases, `symlinks` should return an empty vector.
-This API supplies identities and symlinks; it does not supply arbitrary dataset
-facets or refresh metadata after execution. The existing synthetic `dataSource`
-facet remains unchanged.
+Resolvers supply identities and symlinks. Use [facet builders](#facet-builders)
+for additional metadata. The existing synthetic `dataSource` facet remains
+unchanged.
 
 Resolution runs before START. Each distinct table reference/source/access
 combination is resolved once per extraction and shared by table and column
@@ -143,6 +145,96 @@ also emits START and returns the existing `LineageHandle`. These APIs let the ho
 choose when to resolve a write target whose identity becomes available during
 target preparation. The synchronous `extract` and the original `begin_lineage`
 retain their existing behavior without resolvers.
+
+## Facet builders
+
+Built-in integrations and engine extensions use the same public `facet` module:
+
+- `Facet` describes a serializable payload, its scope, map key, and schema URI.
+- `FacetBuilder` separates `applies_to(context)` from `build(context, sink)`.
+- `FacetBuilderFactory` asynchronously prepares owned builders once per query.
+- `FacetBuilders::default().with(builder)` collects builders of different scopes.
+- `FacetSink<S>::insert` accepts only payloads whose `Facet::Scope` is `S`.
+
+Register a factory using `OpenLineage::builder().facet_factory(Arc::new(factory))`.
+Factory registration appends to the default built-ins. The standard
+`processing_engine` run facet is provided by a built-in factory using this same
+API. To disable it, call
+`.disable_facet_factory(facet::PROCESSING_ENGINE_FACTORY)`. Factory names are
+stable identifiers; disabled names are skipped regardless of registration order,
+and duplicate enabled names use the first registration with a warning. A
+replacement for a disabled factory should use its own name.
+
+| `Facet::Scope` | Context | Destination |
+| --- | --- | --- |
+| `scope::Job` | `JobFacetContext` | `job.facets` |
+| `scope::Run` | `RunFacetContext` | `run.facets` |
+| `scope::Dataset` | `DatasetFacetContext` | Current input/output's `facets` |
+| `scope::InputDataset` | `DatasetFacetContext` | Current input's `inputFacets` |
+| `scope::OutputDataset` | `DatasetFacetContext` | Current output's `outputFacets` |
+
+Every context exposes `event.event_type` and the captured `LineageContext`.
+Dataset contexts also expose the current `dataset`, its read/write `access`, and
+all logical `origins` that resolved to that canonical identity. Use namespace,
+name, and access to select a dataset; each sink is already bound to the exact
+event entry being visited. No contribution is broadcast to other datasets.
+`DatasetOrigin::table_provider()` unwraps a default DataFusion table source;
+custom `TableSource` implementations remain available through `origin.source`.
+DDL targets have no source, and self-joins/aliases may share one emitted dataset.
+
+Factory preparation receives `QueryContext`: the session, logical plan, extracted
+lineage, resolved datasets with origins, run ID, orchestration context, and
+configuration. Retain owned metadata or `Arc` handles in the returned builders.
+Bound asynchronous I/O and return an empty `FacetBuilders` when the integration
+does not apply. No factory runs for queries whose lineage is suppressed.
+
+After preparation, dispatch happens at actual emission:
+
+1. Assemble START, then evaluate predicates and invoke matching builders.
+2. Plan and execute the query.
+3. Finalize COMPLETE or FAIL, including available statistics/error details, then
+   evaluate predicates and invoke matching builders again.
+
+Job/run builders run once per event. Dataset builders run once per eligible
+dataset per event. `build` is never called when `applies_to` is false, and creating
+the COMPLETE template does not run callbacks. Builders are reused within a query,
+including planning failures, DDL, and stream cancellation. They run synchronously
+on the planning/completion path and must remain fast and non-blocking. A planned
+query may never execute, so terminal callbacks are not cleanup guarantees.
+
+All matching builders run, in registration order within each scope; factories run
+in registration order with built-ins first. Builders within one factory observe
+the same event snapshot. The next factory sees successfully merged contributions
+from earlier factories. The library stages each builder's contributions and
+discards them on errors or unwinding panics while continuing with other builders
+and event emission. Abort-on-panic processes cannot recover from panics.
+
+Payloads must serialize to JSON objects and omit `_producer` and `_schemaURL`:
+the sink supplies the configured producer and `Facet::SCHEMA_URL`. Use immutable,
+absolute schema URIs and project-prefixed names for custom facets. The sink checks
+basic shape and metadata; it does not fetch or validate external JSON Schemas.
+Known facet names populate the existing typed fields. Name collisions preserve
+existing values and produce warnings; malformed typed facets discard that
+builder invocation's additions.
+
+For custom planners, pass a `FacetRegistry` to
+`begin_lineage_with_facets(client, context, config, plan, state, resolvers, registry)`.
+The returned `LineageHandle` carries the same prepared builders into its direct
+terminal methods or its plan marker. Existing entry points retain default
+built-ins. Direct event-builder helpers use the built-in processing-engine
+builder but do not prepare engine factories.
+
+See [`examples/custom_facets.rs`](examples/custom_facets.rs) for a complete
+factory with a run facet and a completion-only facet for one input:
+
+```sh
+cargo run -p datafusion-openlineage --example custom_facets
+```
+
+The API preserves provider associations for future shared integrations. Delta and
+Iceberg integrations are not bundled yet. Scan/commit reports still require a
+provider reporting API or execution hook that associates reports with the query's
+actual operations; a facet builder cannot infer those reports from table identity.
 
 ## Transports
 

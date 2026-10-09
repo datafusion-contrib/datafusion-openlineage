@@ -17,7 +17,10 @@ categories = ["database", "development-tools::debugging"]
 openlineage-client = { path = "../openlineage-client", version = "0.0.5", default-features = false }
 datafusion = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true, features = ["v7", "serde"] }

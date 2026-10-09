@@ -98,9 +98,19 @@ pub async fn extract_with_resolvers(
     config: &OpenLineageConfig,
     resolvers: &[Arc<dyn DatasetResolver>],
 ) -> QueryLineage {
+    extract_with_dataset_context(plan, config, resolvers)
+        .await
+        .0
+}
+
+pub(crate) async fn extract_with_dataset_context(
+    plan: &LogicalPlan,
+    config: &OpenLineageConfig,
+    resolvers: &[Arc<dyn DatasetResolver>],
+) -> (QueryLineage, Vec<crate::resolver::ResolvedDataset>) {
     let mut names = DatasetNames::new(&config.job_namespace);
     names.resolve(plan, resolvers).await;
-    extract_with_names(plan, &names)
+    (extract_with_names(plan, &names), names.datasets())
 }
 
 fn extract_with_names(plan: &LogicalPlan, names: &DatasetNames<'_>) -> QueryLineage {

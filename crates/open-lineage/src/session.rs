@@ -19,6 +19,7 @@ use openlineage_client::{ClientError, LineageContext, OpenLineageClient, Transpo
 
 use crate::config::{DataFusionConfig, OpenLineageConfig};
 use crate::context::{LineageContextProvider, StaticContextProvider};
+use crate::facet::{FacetBuilderFactory, FacetRegistry};
 use crate::resolver::DatasetResolver;
 use crate::rule::OpenLineageQueryPlanner;
 
@@ -47,6 +48,7 @@ pub struct OpenLineageBuilder {
     context: Option<Arc<dyn LineageContextProvider>>,
     config: Option<OpenLineageConfig>,
     dataset_resolvers: Vec<Arc<dyn DatasetResolver>>,
+    facets: FacetRegistry,
 }
 
 impl std::fmt::Debug for OpenLineageBuilder {
@@ -57,6 +59,7 @@ impl std::fmt::Debug for OpenLineageBuilder {
             .field("has_context", &self.context.is_some())
             .field("config", &self.config)
             .field("dataset_resolvers", &self.dataset_resolvers.len())
+            .field("facets", &self.facets)
             .finish()
     }
 }
@@ -126,6 +129,21 @@ impl OpenLineageBuilder {
         self
     }
 
+    /// Append a facet factory. Built-in factories remain enabled, and all
+    /// matching builders contribute immediately before each event is emitted.
+    pub fn facet_factory(mut self, factory: Arc<dyn FacetBuilderFactory>) -> Self {
+        self.facets = self.facets.with_factory(factory);
+        self
+    }
+
+    /// Disable a factory by its stable name, independent of registration order.
+    /// For example, [`crate::facet::PROCESSING_ENGINE_FACTORY`] identifies the
+    /// built-in processing-engine facet. Use a different name for a replacement.
+    pub fn disable_facet_factory(mut self, name: impl Into<String>) -> Self {
+        self.facets = self.facets.without_factory(name);
+        self
+    }
+
     /// Install the instrumentation on `state`, returning the wired
     /// `SessionState`.
     ///
@@ -151,7 +169,8 @@ impl OpenLineageBuilder {
             .config
             .unwrap_or_else(OpenLineageConfig::for_datafusion);
 
-        let mut planner = OpenLineageQueryPlanner::new(client, context, config, Vec::new());
+        let mut planner = OpenLineageQueryPlanner::new(client, context, config, Vec::new())
+            .with_facet_registry(self.facets);
         for resolver in self.dataset_resolvers {
             planner = planner.with_dataset_resolver(resolver);
         }
