@@ -1,0 +1,51 @@
+name: API compatibility comment
+
+# workflow_run uses the workflow on the default branch and can comment on fork
+# PRs. It starts working once this file has been merged into main.
+# Only trusted code runs here; the reporter validates and escapes artifact data.
+on: # zizmor: ignore[dangerous-triggers] Required for comments on fork PRs; no PR code is executed.
+  workflow_run:
+    workflows: [API compatibility]
+    types: [completed]
+
+permissions: {}
+
+# Serialize updates from the same PR branch, without delaying unrelated PRs.
+concurrency:
+  group: api-compatibility-comment-${{ github.event.workflow_run.head_repository.id }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    if: ${{ github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      # Only load trusted code from the default branch. Never check out or
+      # execute the PR's code in this job, which holds a write-capable token.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: api-compatibility-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/api-compatibility
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR comment
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REPORT_PATH: ${{ runner.temp }}/api-compatibility/report.json
+        with:
+          script: |
+            const { postReport } = require('./.github/scripts/api-compatibility-comment.cjs');
+            await postReport({ github, context, core, reportPath: process.env.REPORT_PATH });
