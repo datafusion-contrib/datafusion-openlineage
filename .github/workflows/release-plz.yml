@@ -39,11 +39,12 @@ jobs:
         with:
           toolchain: "1.96"
       - name: Run release-plz (release-pr)
-        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        # This action bundles cargo-semver-checks 0.51, whose breaking-change
+        # exit code is understood by release-plz 0.3.170.
+        uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
         with:
           command: release-pr
           # Respect release tag boundaries before inspecting historical manifests.
-          # The action defaults to 0.3.159, which still inspects the import commit.
           version: "0.3.170"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -71,7 +72,7 @@ jobs:
       # No CARGO_REGISTRY_TOKEN secret: crates.io publish authenticates via OIDC
       # (`id-token: write`), which supplies temporary credentials to release-plz.
       - name: Run release-plz (release)
-        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
         with:
           command: release
           version: "0.3.170"
