@@ -1,6 +1,6 @@
 [package]
 name = "datafusion-openlineage"
-version = "0.0.7"
+version = "0.0.8"
 description = "OpenLineage integration for Apache DataFusion sessions"
 edition.workspace = true
 license.workspace = true
@@ -14,7 +14,7 @@ categories = ["database", "development-tools::debugging"]
 
 [dependencies]
 # The engine-agnostic event model, Transport seam, and emit client.
-openlineage-client = { path = "../openlineage-client", version = "0.0.4", default-features = false }
+openlineage-client = { path = "../openlineage-client", version = "0.0.5", default-features = false }
 datafusion = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }

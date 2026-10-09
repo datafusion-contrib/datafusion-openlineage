@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/datafusion-contrib/datafusion-openlineage/compare/datafusion-openlineage-v0.0.7...datafusion-openlineage-v0.0.8) - 2026-10-09
+
+### Added
+
+- support symlinks in dataset resolvers (#4)
+- add pluggable dataset identity resolvers (#3)
+
+### Fixed
+
+- *(ci)* repair release workflows and remove Headwaters leftovers (#5)
+- update ci and repo files after carve-out (#1)
+
 ### Added
 
 - Pluggable async dataset resolvers, registered in order through the builder,
