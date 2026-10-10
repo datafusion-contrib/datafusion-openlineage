@@ -8,11 +8,9 @@ use crate::context::LineageContext;
 use crate::event::{Dataset, Job, RUN_EVENT_SCHEMA_URL, Run, RunEvent, RunEventType};
 use crate::extract::{QueryLineage, input_dataset_facets, output_dataset_facets};
 use crate::facets::{
-    BaseFacet, ErrorMessageRunFacet, JobFacets, JobTypeJobFacet, ProcessingEngineRunFacet,
-    RunFacets, SqlJobFacet,
+    BaseFacet, ErrorMessageRunFacet, JobFacets, JobTypeJobFacet, RunFacets, SqlJobFacet,
 };
 
-const PROCESSING_ENGINE_FACET: &str = "1-1-1/ProcessingEngineRunFacet.json";
 const SQL_FACET: &str = "1-1-0/SQLJobFacet.json";
 const JOB_TYPE_FACET: &str = "2-0-3/JobTypeJobFacet.json";
 const ERROR_FACET: &str = "1-0-1/ErrorMessageRunFacet.json";
@@ -63,13 +61,22 @@ fn base_event(
     config: &OpenLineageConfig,
     error: Option<String>,
 ) -> RunEvent {
+    let mut event = event_template(event_type, run_id, lineage, cx, config, error);
+    crate::facet::enrich_standalone(&mut event, cx, config);
+    event
+}
+
+/// Build an event without invoking any registered facet builders.
+pub(crate) fn event_template(
+    event_type: RunEventType,
+    run_id: Uuid,
+    lineage: &QueryLineage,
+    cx: &LineageContext,
+    config: &OpenLineageConfig,
+    error: Option<String>,
+) -> RunEvent {
     let run_facets = RunFacets {
-        processing_engine: Some(ProcessingEngineRunFacet {
-            base: BaseFacet::new(&config.producer, PROCESSING_ENGINE_FACET),
-            version: config.engine_version.clone(),
-            name: config.engine_name.clone(),
-            openlineage_adapter_version: config.adapter_version.clone(),
-        }),
+        processing_engine: None,
         parent: cx.parent_run.clone(),
         nominal_time: None,
         error_message: error.map(|message| ErrorMessageRunFacet {

@@ -32,6 +32,7 @@ use futures::Stream;
 
 use crate::client::OpenLineageClient;
 use crate::event::{RunEvent, RunEventType};
+use crate::facet::PreparedFacets;
 use crate::facets::{
     BaseFacet, ErrorMessageRunFacet, InputStatisticsInputDatasetFacet,
     OutputStatisticsOutputDatasetFacet,
@@ -52,6 +53,7 @@ struct RunState {
     /// COMPLETE event template (cloned and mutated into FAIL on error).
     complete: RunEvent,
     producer: String,
+    facets: Option<Arc<PreparedFacets>>,
     /// The wrapped plan, read for native runtime metrics on completion. Tracked
     /// through `with_new_children` rewrites so metrics come from the node that
     /// actually executed.
@@ -144,7 +146,11 @@ impl RunState {
             self.attach_output_statistics(&mut event);
             self.attach_input_statistics(&mut event);
         }
-        self.client.emit(event);
+        if let Some(facets) = &self.facets {
+            facets.emit(&self.client, event);
+        } else {
+            self.client.emit(event);
+        }
     }
 
     /// Attach an `outputStatistics` facet to each output dataset of the COMPLETE
@@ -303,11 +309,22 @@ impl OpenLineageExec {
         complete: RunEvent,
         producer: String,
     ) -> Arc<Self> {
+        Self::new_with_facets(inner, client, complete, producer, None)
+    }
+
+    pub(crate) fn new_with_facets(
+        inner: Arc<dyn ExecutionPlan>,
+        client: OpenLineageClient,
+        complete: RunEvent,
+        producer: String,
+        facets: Option<Arc<PreparedFacets>>,
+    ) -> Arc<Self> {
         let has_outputs = !complete.outputs.is_empty();
         let state = Arc::new(RunState {
             client,
             complete,
             producer,
+            facets,
             has_outputs,
             inner: std::sync::Mutex::new(inner.clone()),
             // Initialized lazily on the first `execute()` from the partition

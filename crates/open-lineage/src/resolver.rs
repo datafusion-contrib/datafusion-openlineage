@@ -21,6 +21,47 @@ pub enum DatasetAccess {
     Write,
 }
 
+/// A logical source contributing to a resolved dataset.
+///
+/// Sources are retained for facet factories to inspect provider metadata. DDL
+/// targets have no source; distinct sources can share a canonical identity.
+#[derive(Clone)]
+pub struct DatasetOrigin {
+    /// The logical table reference before identity resolution.
+    pub table_ref: TableReference,
+    /// The scan source or DML target, absent for DDL targets.
+    pub source: Option<Arc<dyn TableSource>>,
+}
+
+impl Debug for DatasetOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatasetOrigin")
+            .field("table_ref", &self.table_ref)
+            .field("has_source", &self.source.is_some())
+            .finish()
+    }
+}
+
+impl DatasetOrigin {
+    /// Unwrap DataFusion's default table source, if present.
+    pub fn table_provider(&self) -> Option<Arc<dyn TableProvider>> {
+        self.source
+            .as_ref()
+            .and_then(|source| source_as_provider(source).ok())
+    }
+}
+
+/// A canonical dataset and the logical sources that resolved to it.
+#[derive(Debug, Clone)]
+pub struct ResolvedDataset {
+    /// Canonical identity used in emitted events and column lineage.
+    pub name: DatasetName,
+    /// Input or output role. Reading and writing one identity are distinct.
+    pub access: DatasetAccess,
+    /// Distinct table-reference/source pairs contributing to this dataset.
+    pub origins: Vec<DatasetOrigin>,
+}
+
 /// Information available when resolving a dataset's OpenLineage identity.
 pub struct DatasetResolutionContext<'a> {
     /// The table reference carried by the logical-plan node.
@@ -124,7 +165,7 @@ impl DatasetRequest {
     }
 }
 
-struct ResolvedDataset {
+struct ResolvedIdentity {
     name: DatasetName,
     symlinks: Vec<SymlinkIdentifier>,
 }
@@ -133,7 +174,7 @@ struct ResolvedDataset {
 /// matters: unrelated scans can carry the same logical table reference.
 pub(crate) struct DatasetNames<'a> {
     default_namespace: &'a str,
-    resolved: Vec<(DatasetRequest, ResolvedDataset)>,
+    resolved: Vec<(DatasetRequest, ResolvedIdentity)>,
 }
 
 impl<'a> DatasetNames<'a> {
@@ -149,9 +190,6 @@ impl<'a> DatasetNames<'a> {
         plan: &LogicalPlan,
         resolvers: &[Arc<dyn DatasetResolver>],
     ) {
-        if resolvers.is_empty() {
-            return;
-        }
         let mut requests = Vec::new();
         // This walk never errors. Keep the visitors synchronous and await only
         // the metadata lookups, once per distinct request (including fallback).
@@ -186,7 +224,7 @@ impl<'a> DatasetNames<'a> {
                 DatasetName::from_table_ref(self.default_namespace, &request.table_ref.to_string())
             });
             self.resolved
-                .push((request, ResolvedDataset { name, symlinks }));
+                .push((request, ResolvedIdentity { name, symlinks }));
         }
     }
 
@@ -203,6 +241,29 @@ impl<'a> DatasetNames<'a> {
             .unwrap_or_else(|| {
                 DatasetName::from_table_ref(self.default_namespace, &table_ref.to_string())
             })
+    }
+
+    pub(crate) fn datasets(&self) -> Vec<ResolvedDataset> {
+        let mut datasets: Vec<ResolvedDataset> = Vec::new();
+        for (request, identity) in &self.resolved {
+            let origin = DatasetOrigin {
+                table_ref: request.table_ref.clone(),
+                source: request.source.clone(),
+            };
+            if let Some(dataset) = datasets
+                .iter_mut()
+                .find(|dataset| dataset.name == identity.name && dataset.access == request.access)
+            {
+                dataset.origins.push(origin);
+            } else {
+                datasets.push(ResolvedDataset {
+                    name: identity.name.clone(),
+                    access: request.access,
+                    origins: vec![origin],
+                });
+            }
+        }
+        datasets
     }
 
     pub(crate) fn symlinks(
