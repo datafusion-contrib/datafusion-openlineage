@@ -32,7 +32,7 @@ const LIFECYCLE_FACET: &str = "1-0-1/LifecycleStateChangeDatasetFacet.json";
 const SYMLINKS_FACET: &str = "1-0-1/SymlinksDatasetFacet.json#/$defs/SymlinksDatasetFacet";
 
 /// What a query reads and writes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct QueryLineage {
     /// Datasets the query reads from.
     pub inputs: Vec<InputTable>,
@@ -44,7 +44,7 @@ pub struct QueryLineage {
 }
 
 /// A dataset a query reads, with its schema.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InputTable {
     /// The OpenLineage dataset identifier.
     pub name: DatasetName,
@@ -55,7 +55,7 @@ pub struct InputTable {
 }
 
 /// A dataset a query writes, with its schema and optional column lineage.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OutputTable {
     /// The OpenLineage dataset identifier.
     pub name: DatasetName,
@@ -113,7 +113,7 @@ pub(crate) async fn extract_with_dataset_context(
     (extract_with_names(plan, &names), names.datasets())
 }
 
-fn extract_with_names(plan: &LogicalPlan, names: &DatasetNames<'_>) -> QueryLineage {
+pub(crate) fn extract_with_names(plan: &LogicalPlan, names: &DatasetNames) -> QueryLineage {
     let mut visitor = LineageVisitor {
         names,
         inputs: Vec::new(),
@@ -190,7 +190,7 @@ pub(crate) fn schema_fields(fields: &datafusion::arrow::datatypes::Fields) -> Ve
 }
 
 struct LineageVisitor<'a> {
-    names: &'a DatasetNames<'a>,
+    names: &'a DatasetNames,
     inputs: Vec<InputTable>,
     outputs: Vec<OutputTable>,
 }

@@ -22,7 +22,7 @@ use datafusion_openlineage::facet::{
 use datafusion_openlineage::{
     DatasetAccess, DatasetName, DatasetResolutionContext, DatasetResolver, OpenLineage,
     OpenLineageClient, OpenLineageConfig, OpenLineageSqlExt, RunEventType, StaticContextProvider,
-    begin_lineage_with_facets,
+    begin_lineage,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -169,6 +169,23 @@ impl FacetBuilder for DatasetProbe {
     type Scope = scope::Dataset;
     fn applies_to(&self, cx: &DatasetFacetContext<'_>) -> bool {
         self.0.dataset_checks.fetch_add(1, Ordering::Relaxed);
+        if cx.access == DatasetAccess::Write {
+            let providers = cx
+                .origins
+                .iter()
+                .filter(|origin| {
+                    origin
+                        .table_provider()
+                        .is_some_and(|provider| provider.downcast_ref::<MemTable>().is_some())
+                })
+                .count();
+            self.0.origins.lock().unwrap().push((
+                cx.dataset.name.clone(),
+                cx.access,
+                cx.origins.len(),
+                providers,
+            ));
+        }
         cx.dataset.name == "dst" && cx.access == DatasetAccess::Write
     }
     fn build(
@@ -247,7 +264,7 @@ async fn scopes_targets_and_callbacks_follow_actual_emission() {
         .await
         .unwrap();
     assert_eq!(calls.factories.load(Ordering::Relaxed), 1);
-    assert_eq!(calls.dataset_checks.load(Ordering::Relaxed), 3);
+    assert_eq!(calls.dataset_checks.load(Ordering::Relaxed), 2);
     assert!(
         calls
             .builds
@@ -258,7 +275,7 @@ async fn scopes_targets_and_callbacks_follow_actual_emission() {
     );
     assert_eq!(
         calls.builds.lock().unwrap().len(),
-        2,
+        1,
         "creating the COMPLETE template runs no builders"
     );
 
@@ -268,11 +285,14 @@ async fn scopes_targets_and_callbacks_follow_actual_emission() {
     let events = transport.events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[1].event_type, RunEventType::Complete);
-    assert_eq!(calls.dataset_checks.load(Ordering::Relaxed), 6);
-    assert_eq!(calls.builds.lock().unwrap().len(), 4);
+    assert_eq!(calls.dataset_checks.load(Ordering::Relaxed), 5);
+    assert_eq!(calls.builds.lock().unwrap().len(), 3);
     for event in &events {
         assert_eq!(event.inputs.len(), 2);
-        assert_eq!(event.outputs.len(), 1);
+        assert_eq!(
+            event.outputs.len(),
+            usize::from(event.event_type == RunEventType::Complete)
+        );
         assert_eq!(event.job.facets.extra["test_observed"]["target"], "job");
         assert_eq!(
             event.run.facets.extra["test_observed"]["event_type"],
@@ -286,6 +306,9 @@ async fn scopes_targets_and_callbacks_follow_actual_emission() {
                 input.name
             );
         }
+        if event.event_type != RunEventType::Complete {
+            continue;
+        }
         let output = &event.outputs[0];
         assert_eq!(output.facets.extra["test_observed"]["target"], "dst");
         assert!(output.input_facets.is_none());
@@ -298,7 +321,7 @@ async fn scopes_targets_and_callbacks_follow_actual_emission() {
             Probe::<scope::Dataset>::SCHEMA_URL
         );
     }
-    assert!(events[0].outputs[0].output_facets.is_none());
+    assert!(events[0].outputs.is_empty());
     assert_eq!(
         events[1].outputs[0].output_facets.as_ref().unwrap().extra["test_observed"]["rows"],
         2
@@ -441,19 +464,19 @@ async fn custom_planner_preserves_all_origins_and_dispatches_planning_failure() 
         .await
         .unwrap();
     let registry = FacetRegistry::default().with_factory(Arc::new(Probes(calls.clone())));
-    let handle = begin_lineage_with_facets(
+    let handle = begin_lineage(
         &client,
         &StaticContextProvider::default(),
         &config(),
         &plan,
         &state,
-        &[Arc::new(SameIdentity)],
-        &registry,
     )
+    .with_resolvers(&[Arc::new(SameIdentity)])
+    .with_facets(&registry)
+    .start()
     .await
     .unwrap();
-    handle.emit_fail(&client, &config(), "physical planning failed");
-    drop(handle);
+    handle.fail("physical planning failed");
     client.shutdown().await;
     let events = transport.events();
     assert_eq!(events.len(), 2);
@@ -462,7 +485,12 @@ async fn custom_planner_preserves_all_origins_and_dispatches_planning_failure() 
     assert_eq!(events[0].inputs[0].name, "shared");
     let origins = calls.origins.lock().unwrap();
     assert!(origins.contains(&("shared".into(), DatasetAccess::Read, 2, 2)));
-    assert!(origins.contains(&("shared".into(), DatasetAccess::Write, 1, 1)));
+    assert!(
+        origins
+            .iter()
+            .all(|(_, access, _, _)| *access == DatasetAccess::Read)
+    );
+    assert!(events.iter().all(|event| event.outputs.is_empty()));
 }
 
 #[tokio::test]

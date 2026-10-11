@@ -132,19 +132,65 @@ Resolvers supply identities and symlinks. Use [facet builders](#facet-builders)
 for additional metadata. The existing synthetic `dataSource` facet remains
 unchanged.
 
-Resolution runs before START. Each distinct table reference/source/access
-combination is resolved once per extraction and shared by table and column
-lineage. Symlinks are fetched once for each successful resolution. The run retains
-both names and symlinks for COMPLETE or FAIL. Metadata-only scans
-of `information_schema` remain excluded.
+Event lifecycles resolve inputs before START and outputs only after successful
+execution. Each distinct table reference/source/access combination is resolved
+once and shared by table and column lineage. Input identities and symlinks remain
+pinned, including when the query reads and writes the same table.
+Metadata-only scans of `information_schema` remain excluded.
 
-For hosts with custom planners, `extract_with_resolvers(plan, config, resolvers)`
-provides asynchronous extraction without installing a query planner.
-`begin_lineage_with_resolvers(client, context, config, plan, state, resolvers)`
-also emits START and returns the existing `LineageHandle`. These APIs let the host
-choose when to resolve a write target whose identity becomes available during
-target preparation. The synchronous `extract` and the original `begin_lineage`
-retain their existing behavior without resolvers.
+For standalone extraction, `extract_with_resolvers(plan, config, resolvers)`
+resolves both inputs and outputs immediately without emitting events.
+
+## Query lifecycle
+
+Hosts that manage execution configure one entry point:
+
+```rust,ignore
+let handle = begin_lineage(client, context, config, plan, state)
+    .with_resolvers(resolvers) // optional: default naming without resolvers
+    .with_facets(facets)       // optional: built-in registry by default
+    .start()
+    .await;
+```
+
+Constructing the builder does not emit anything. `start()` resolves inputs,
+prepares facet factories once, emits START without outputs, and returns an
+`Option<LineageHandle>`. Output-only queries still emit START; dataset-free
+queries and nested instrumented DDL bodies return `None`.
+
+After executing and consuming results or finishing the write, await
+`handle.complete()`. It resolves outputs from the providers'
+actual write results, builds their facets and column lineage, and emits COMPLETE.
+The COMPLETE timestamp is captured when `complete()` is called, before resolver I/O.
+On error, call `handle.fail(error)`; it never resolves or reports outputs.
+Both operations consume the handle. Dropping an unfinished handle or its completion
+future emits FAIL, including cancellation during output resolution. The handle owns
+its original client and configuration, so terminal operations take neither argument.
+
+Alternatively, `handle.create_physical_plan(planner, state).await` consumes the
+handle and uses the supplied DataFusion `PhysicalPlanner` to plan the original
+logical plan. Register `LineageExtensionPlanner` on that planner. The handle stays
+armed during planning: errors emit FAIL with the actual planning error and return
+that error unchanged; cancellation emits FAIL even if marker clones survive.
+Successful planning transfers terminal handling to the returned physical plan.
+Session instrumentation uses this same public API. START and FAIL omit outputs,
+and the result stream awaits output resolution before completing.
+Dropping that stream during resolution emits FAIL without outputs. Marker and physical
+plan clones share one terminal state, so the same run cannot emit COMPLETE and FAIL.
+Finish or drop every handle and plan before awaiting client shutdown.
+
+Factories see input identities and the original logical plan during preparation.
+Dataset builders receive final output origins on COMPLETE; factories must not
+cache output names before execution. Resolvers must inspect bounded, read-only
+metadata; hosts record committed identities in providers instead of having
+lineage prepare or execute writes.
+
+This replaces `begin_lineage_with_resolvers`, `begin_lineage_with_facets`, and
+`begin_lineage_with_deferred_outputs`. Direct `begin_lineage(...).await` callers
+must use `.start().await`. Replace `emit_complete(client, config)` with
+`complete().await`, `emit_fail(client, config, error)` with `fail(error)`, and
+`to_marker(...)` / `into_marker()` followed by physical planning with
+`create_physical_plan(planner, state).await`. Handles are no longer cloneable.
 
 ## Facet builders
 
@@ -218,9 +264,9 @@ existing values and produce warnings; malformed typed facets discard that
 builder invocation's additions.
 
 For custom planners, pass a `FacetRegistry` to
-`begin_lineage_with_facets(client, context, config, plan, state, resolvers, registry)`.
+`begin_lineage(client, context, config, plan, state).with_facets(registry).start().await`.
 The returned `LineageHandle` carries the same prepared builders into its direct
-terminal methods or its plan marker. Existing entry points retain default
+terminal methods or its plan marker. Omitting `.with_facets(...)` retains default
 built-ins. Direct event-builder helpers use the built-in processing-engine
 builder but do not prepare engine factories.
 

@@ -155,7 +155,7 @@ pub struct ResolvedColumns {
 /// Resolve the column lineage of the dataset written by `plan`.
 pub(crate) fn resolve_output_columns(
     plan: &LogicalPlan,
-    names: &DatasetNames<'_>,
+    names: &DatasetNames,
 ) -> Option<ResolvedColumns> {
     match plan {
         LogicalPlan::Dml(dml) => match dml.op {
@@ -233,7 +233,7 @@ fn degrade<T>(plan: &LogicalPlan, reason: &str) -> Option<T> {
 }
 
 /// Bottom-up positional resolution of a relational plan node.
-fn resolve(plan: &LogicalPlan, names: &DatasetNames<'_>) -> Option<NodeLineage> {
+fn resolve(plan: &LogicalPlan, names: &DatasetNames) -> Option<NodeLineage> {
     let node = match plan {
         LogicalPlan::TableScan(scan) => {
             // information_schema is DataFusion's metadata surface, not a real
