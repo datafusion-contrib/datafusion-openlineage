@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 
 use common::RecordingTransport;
 use datafusion::prelude::SessionContext;
+use datafusion_openlineage::OpenLineageSqlExt;
 use datafusion_openlineage::config::OpenLineageConfig;
 use datafusion_openlineage::event::RunEvent;
 use datafusion_openlineage::{OpenLineageClient, instrument_session_state_simple};
@@ -116,7 +117,7 @@ async fn capture(setup: &[&str], query: &str) -> Vec<RunEvent> {
     for stmt in setup {
         ctx.sql(stmt).await.expect("setup DDL").collect().await.ok();
     }
-    if let Ok(df) = ctx.sql(query).await {
+    if let Ok(df) = ctx.sql_with_lineage(query).await {
         let _ = df.collect().await; // ok or err — both are valid coverage
     }
 
@@ -311,15 +312,14 @@ async fn data_source_facet_conforms() {
 async fn lifecycle_state_change_facet_conforms() {
     let validator = validator_for(LIFECYCLE_FACET);
 
-    // An INSERT OVERWRITE rewrites the output table, which maps to the spec's
-    // `OVERWRITE` state change (a plain append carries no lifecycle facet). The
-    // state change rides on the output dataset.
+    // A successful CTAS reports CREATE on its output. Unsupported MemTable
+    // overwrites fail and correctly report no output lifecycle facet.
     let events = capture(
         &[
             "CREATE TABLE src (a INT) AS VALUES (1), (2)",
             "CREATE TABLE dst (a INT) AS VALUES (0)",
         ],
-        "INSERT OVERWRITE dst SELECT a FROM src",
+        "CREATE TABLE created AS SELECT a FROM src",
     )
     .await;
 

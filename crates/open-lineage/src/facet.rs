@@ -166,7 +166,8 @@ pub trait FacetBuilder: Debug + Send + Sync + 'static {
     ) -> Result<(), FacetError>;
 }
 
-/// Prepares builders once per query, before START, after identity resolution.
+/// Prepares builders once per query, before START, after input identity resolution.
+/// Output identities are resolved after execution and supplied to dataset builders.
 ///
 /// Returned builders own their state or shared handles; they cannot borrow the
 /// temporary context. Bound any metadata I/O. An error or unwinding panic skips
@@ -338,9 +339,18 @@ pub(crate) struct PreparedFacets {
 }
 
 impl PreparedFacets {
-    pub(crate) fn emit(&self, client: &crate::OpenLineageClient, mut event: RunEvent) {
+    pub(crate) fn emit(&self, client: &crate::OpenLineageClient, event: RunEvent) {
+        self.emit_with_datasets(client, event, &self.datasets);
+    }
+
+    pub(crate) fn emit_with_datasets(
+        &self,
+        client: &crate::OpenLineageClient,
+        mut event: RunEvent,
+        datasets: &[ResolvedDataset],
+    ) {
         for (name, builders) in &self.factories {
-            builders.enrich(&mut event, &self.query, &self.datasets, name);
+            builders.enrich(&mut event, &self.query, datasets, name);
         }
         client.emit(event);
     }

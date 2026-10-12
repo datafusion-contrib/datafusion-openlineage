@@ -3,7 +3,8 @@
 //! [`OpenLineageConfig`] itself is engine-agnostic and lives in
 //! [`openlineage_client`]. This module adds [`DataFusionConfig`], an extension
 //! trait that stamps the DataFusion `processing_engine` identity (name +
-//! [`datafusion::DATAFUSION_VERSION`]) and a DataFusion-flavored producer.
+//! [`datafusion::DATAFUSION_VERSION`]), this integration's adapter version, and
+//! a DataFusion-flavored producer.
 
 pub use openlineage_client::OpenLineageConfig;
 
@@ -45,6 +46,7 @@ impl DataFusionConfig for OpenLineageConfig {
 fn stamp_datafusion(mut cfg: OpenLineageConfig) -> OpenLineageConfig {
     cfg.engine_name = "DataFusion".to_string();
     cfg.engine_version = datafusion::DATAFUSION_VERSION.to_string();
+    cfg.adapter_version = env!("CARGO_PKG_VERSION").to_string();
     cfg
 }
 
@@ -54,13 +56,14 @@ mod tests {
 
     #[test]
     fn datafusion_identity_is_stable() {
-        let cfg = OpenLineageConfig::for_datafusion();
-        assert_eq!(cfg.producer, DATAFUSION_PRODUCER);
-        assert_eq!(cfg.engine_name, "DataFusion");
-        // `engine_version` is DataFusion's version, stamped by this crate.
-        assert!(!cfg.engine_version.is_empty());
-        // Note: `adapter_version` is owned and stamped by `openlineage-client`
-        // (its own CARGO_PKG_VERSION) and covered by that crate's tests — it is
-        // *not* this crate's version, so we don't assert it here.
+        for cfg in [
+            OpenLineageConfig::for_datafusion(),
+            OpenLineageConfig::for_datafusion_from_env(),
+        ] {
+            assert_eq!(cfg.producer, DATAFUSION_PRODUCER);
+            assert_eq!(cfg.engine_name, "DataFusion");
+            assert_eq!(cfg.engine_version, datafusion::DATAFUSION_VERSION);
+            assert_eq!(cfg.adapter_version, env!("CARGO_PKG_VERSION"));
+        }
     }
 }

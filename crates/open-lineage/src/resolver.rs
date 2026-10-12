@@ -91,8 +91,9 @@ impl DatasetResolutionContext<'_> {
 /// for an unrecognized source or unavailable identity; if every resolver returns
 /// `None`, extraction uses the table reference under the configured job namespace.
 ///
-/// Resolution runs before START and may await metadata I/O. Implementations must
-/// bound that I/O, log lookup failures and return `None` rather than fail the
+/// Event lifecycles resolve reads before START and writes only when emitting
+/// COMPLETE. Standalone extraction resolves both immediately. Resolution may await metadata I/O.
+/// Implementations must bound that I/O, log lookup failures and return `None` rather than fail the
 /// query. Resolution should inspect metadata without preparing or executing
 /// writes. The host owns identities that become available later in execution.
 #[async_trait]
@@ -116,6 +117,7 @@ pub trait DatasetResolver: Debug + Send + Sync {
     }
 }
 
+#[derive(Clone)]
 struct DatasetRequest {
     table_ref: TableReference,
     source: Option<Arc<dyn TableSource>>,
@@ -165,6 +167,7 @@ impl DatasetRequest {
     }
 }
 
+#[derive(Clone)]
 struct ResolvedIdentity {
     name: DatasetName,
     symlinks: Vec<SymlinkIdentifier>,
@@ -172,15 +175,16 @@ struct ResolvedIdentity {
 
 /// A query-local lookup shared by table and column extraction. Source identity
 /// matters: unrelated scans can carry the same logical table reference.
-pub(crate) struct DatasetNames<'a> {
-    default_namespace: &'a str,
+#[derive(Clone)]
+pub(crate) struct DatasetNames {
+    default_namespace: String,
     resolved: Vec<(DatasetRequest, ResolvedIdentity)>,
 }
 
-impl<'a> DatasetNames<'a> {
-    pub(crate) fn new(default_namespace: &'a str) -> Self {
+impl DatasetNames {
+    pub(crate) fn new(default_namespace: &str) -> Self {
         Self {
-            default_namespace,
+            default_namespace: default_namespace.to_owned(),
             resolved: Vec::new(),
         }
     }
@@ -190,11 +194,22 @@ impl<'a> DatasetNames<'a> {
         plan: &LogicalPlan,
         resolvers: &[Arc<dyn DatasetResolver>],
     ) {
+        self.resolve_access(plan, resolvers, None).await;
+    }
+
+    pub(crate) async fn resolve_access(
+        &mut self,
+        plan: &LogicalPlan,
+        resolvers: &[Arc<dyn DatasetResolver>],
+        access: Option<DatasetAccess>,
+    ) {
         let mut requests = Vec::new();
         // This walk never errors. Keep the visitors synchronous and await only
         // the metadata lookups, once per distinct request (including fallback).
         let _ = plan.apply(|node| {
-            if let Some(request) = DatasetRequest::from_plan(node) {
+            if let Some(request) = DatasetRequest::from_plan(node)
+                && access.is_none_or(|access| access == request.access)
+            {
                 requests.push(request);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -209,7 +224,7 @@ impl<'a> DatasetNames<'a> {
                 table_ref: &request.table_ref,
                 source: request.source.as_ref(),
                 access: request.access,
-                default_namespace: self.default_namespace,
+                default_namespace: &self.default_namespace,
             };
             let mut name = None;
             let mut symlinks = Vec::new();
@@ -221,7 +236,7 @@ impl<'a> DatasetNames<'a> {
                 }
             }
             let name = name.unwrap_or_else(|| {
-                DatasetName::from_table_ref(self.default_namespace, &request.table_ref.to_string())
+                DatasetName::from_table_ref(&self.default_namespace, &request.table_ref.to_string())
             });
             self.resolved
                 .push((request, ResolvedIdentity { name, symlinks }));
@@ -239,7 +254,7 @@ impl<'a> DatasetNames<'a> {
             .find(|(request, _)| request.matches(table_ref, source, access))
             .map(|(_, dataset)| dataset.name.clone())
             .unwrap_or_else(|| {
-                DatasetName::from_table_ref(self.default_namespace, &table_ref.to_string())
+                DatasetName::from_table_ref(&self.default_namespace, &table_ref.to_string())
             })
     }
 

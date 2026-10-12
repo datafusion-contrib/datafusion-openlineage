@@ -23,8 +23,7 @@ use datafusion_openlineage::facets::SymlinkIdentifier;
 use datafusion_openlineage::{
     DatasetAccess, DatasetName, DatasetResolutionContext, DatasetResolver, LineageContext,
     OpenLineage, OpenLineageClient, OpenLineageConfig, OpenLineageSqlExt, QueryLineage,
-    RunEventType, StaticContextProvider, begin_lineage_with_resolvers, extract,
-    extract_with_resolvers,
+    RunEventType, StaticContextProvider, begin_lineage, extract, extract_with_resolvers,
 };
 
 fn config() -> OpenLineageConfig {
@@ -234,9 +233,24 @@ async fn builder_resolvers_apply_to_start_complete_fail_and_column_lineage() {
     for event in &events {
         assert_eq!(event.job.namespace, "jobs");
         assert_eq!(event.inputs.len(), 1);
-        assert_eq!(event.outputs.len(), 1);
+        assert_eq!(
+            event.outputs.len(),
+            usize::from(event.event_type == RunEventType::Complete)
+        );
         assert_eq!(event.inputs[0].namespace, "s3://warehouse");
         assert_eq!(event.inputs[0].name, "source");
+        assert_eq!(
+            event.inputs[0]
+                .facets
+                .symlinks
+                .as_ref()
+                .unwrap()
+                .identifiers,
+            vec![alias("src")]
+        );
+        if event.event_type != RunEventType::Complete {
+            continue;
+        }
         assert_eq!(event.outputs[0].namespace, "s3://warehouse");
         assert_eq!(event.outputs[0].name, "destination");
         for (dataset, table) in [(&event.inputs[0], "src"), (&event.outputs[0], "dst")] {
@@ -257,7 +271,7 @@ async fn builder_resolvers_apply_to_start_complete_fail_and_column_lineage() {
             }
         }
     }
-    let columns = events[0].outputs[0].facets.column_lineage.as_ref().unwrap();
+    let columns = events[1].outputs[0].facets.column_lineage.as_ref().unwrap();
     assert!(columns.fields["a"].input_fields.iter().any(|input| {
         input.field.as_deref() == Some("b")
             && input
@@ -265,11 +279,10 @@ async fn builder_resolvers_apply_to_start_complete_fail_and_column_lineage() {
                 .iter()
                 .any(|t| t.subtype.as_deref() == Some("FILTER"))
     }));
-    // One read and one write lookup per query, shared by table/column extraction
-    // and START/terminal events; a new query resolves again.
-    assert_eq!(declining.0.load(Ordering::Relaxed), 4);
-    assert_eq!(resolver.calls.lock().unwrap().len(), 4);
-    assert_eq!(resolver.symlink_calls.load(Ordering::Relaxed), 4);
+    // One input lookup per query; only the successful query resolves its output.
+    assert_eq!(declining.0.load(Ordering::Relaxed), 3);
+    assert_eq!(resolver.calls.lock().unwrap().len(), 3);
+    assert_eq!(resolver.symlink_calls.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]
@@ -475,7 +488,12 @@ async fn ddl_targets_have_no_source_and_share_resolvers_with_inputs() {
         assert_eq!(events[0].event_type, RunEventType::Start);
         assert_eq!(events[1].event_type, RunEventType::Complete);
         assert_eq!(events[0].run.run_id, events[1].run.run_id);
-        for event in events {
+        assert!(events[0].outputs.is_empty());
+        assert_eq!(events[0].inputs[0].name, "source");
+        for event in events
+            .into_iter()
+            .filter(|event| event.event_type == RunEventType::Complete)
+        {
             assert_eq!(event.outputs[0].namespace, "s3://warehouse");
             assert_eq!(event.outputs[0].name, "created");
             assert_eq!(event.inputs[0].name, "source");
@@ -509,8 +527,8 @@ async fn ddl_targets_have_no_source_and_share_resolvers_with_inputs() {
         }
         let calls = resolver.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!((calls[0].1, calls[0].2), (DatasetAccess::Write, false));
-        assert_eq!((calls[1].1, calls[1].2), (DatasetAccess::Read, true));
+        assert_eq!((calls[0].1, calls[0].2), (DatasetAccess::Read, true));
+        assert_eq!((calls[1].1, calls[1].2), (DatasetAccess::Write, false));
     }
 
     let plan = plan(
@@ -588,17 +606,18 @@ async fn custom_planner_entry_point_retains_resolved_identities() {
     let ctx = context();
     let plan = plan(&ctx, "SELECT a FROM src").await;
     let cfg = config();
-    let handle = begin_lineage_with_resolvers(
+    let handle = begin_lineage(
         &client,
         &StaticContextProvider::default(),
         &cfg,
         &plan,
         &ctx.state(),
-        &[Arc::new(ProviderResolver::default())],
     )
+    .with_resolvers(&[Arc::new(ProviderResolver::default())])
+    .start()
     .await
     .unwrap();
-    handle.emit_complete(&client, &cfg);
+    handle.complete().await;
     client.shutdown().await;
     let events = transport.events();
     assert_eq!(events.len(), 2);

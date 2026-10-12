@@ -1,13 +1,13 @@
 //! Physical-plan wrapper that emits COMPLETE / FAIL at end of execution.
 //!
 //! [`crate::rule::OpenLineageQueryPlanner`] emits START at plan time and carries
-//! a COMPLETE template through the plan in a [`crate::rule::LineageMarker`];
+//! the query lifecycle through the plan in a [`crate::rule::LineageMarker`];
 //! [`crate::rule::LineageExtensionPlanner`] lowers that marker into an
 //! [`OpenLineageExec`] at the physical root. This node observes the result
 //! streams and emits exactly one terminal event once every output partition has
 //! finished:
 //!
-//! - COMPLETE when all partitions drain successfully;
+//! - COMPLETE after all partitions drain and asynchronous output resolution finishes;
 //! - FAIL (with an `errorMessage` run facet) if any partition yields an error
 //!   or is dropped before its stream is exhausted (e.g. a cancelled query).
 //!
@@ -28,15 +28,15 @@ use datafusion::error::Result;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use futures::Stream;
+use futures::{FutureExt, Stream, future::BoxFuture};
 
 use crate::client::OpenLineageClient;
 use crate::event::{RunEvent, RunEventType};
-use crate::facet::PreparedFacets;
 use crate::facets::{
     BaseFacet, ErrorMessageRunFacet, InputStatisticsInputDatasetFacet,
     OutputStatisticsOutputDatasetFacet,
 };
+use crate::lineage::LineageRun;
 
 const ERROR_FACET: &str = "1-0-1/ErrorMessageRunFacet.json";
 const OUTPUT_STATS_FACET: &str = "1-0-2/OutputStatisticsOutputDatasetFacet.json";
@@ -53,7 +53,7 @@ struct RunState {
     /// COMPLETE event template (cloned and mutated into FAIL on error).
     complete: RunEvent,
     producer: String,
-    facets: Option<Arc<PreparedFacets>>,
+    lineage: Option<Arc<LineageRun>>,
     /// The wrapped plan, read for native runtime metrics on completion. Tracked
     /// through `with_new_children` rewrites so metrics come from the node that
     /// actually executed.
@@ -111,13 +111,30 @@ impl RunState {
 
     /// Mark one partition finished; emit the terminal event when the last one
     /// completes. Safe to call once per partition (including from `Drop`).
-    fn partition_finished(&self) {
-        // `remaining` starts at the partition count; the partition that brings
-        // it to zero emits.
+    fn partition_finished(self: &Arc<Self>) -> Option<BoxFuture<'static, ()>> {
         if self.remaining.fetch_sub(1, Ordering::SeqCst) != 1 {
-            return;
+            return None;
+        }
+        if !self.failed.load(Ordering::SeqCst)
+            && let Some(run) = &self.lineage
+        {
+            // Capture execution end before resolution, even if the returned
+            // future is not polled immediately. Its guard also covers cancellation.
+            let completion = run.begin_completion(Utc::now())?;
+            let state = self.clone();
+            return Some(
+                async move {
+                    let (mut event, datasets) = completion.event().await;
+                    state.attach_output_statistics(&mut event);
+                    state.attach_input_statistics(&mut event);
+                    state.emitted.store(true, Ordering::SeqCst);
+                    completion.emit(event, &datasets);
+                }
+                .boxed(),
+            );
         }
         self.emit_terminal();
+        None
     }
 
     fn emit_terminal(&self) {
@@ -130,12 +147,17 @@ impl RunState {
         event.event_time = Utc::now().to_rfc3339();
         if self.failed.load(Ordering::SeqCst) {
             event.event_type = RunEventType::Fail;
+            event.outputs.clear();
             let message = self
                 .error
                 .lock()
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "query failed".to_string());
+            if let Some(run) = &self.lineage {
+                run.fail(&message);
+                return;
+            }
             event.run.facets.error_message = Some(ErrorMessageRunFacet {
                 base: BaseFacet::new(&self.producer, ERROR_FACET),
                 message,
@@ -146,11 +168,7 @@ impl RunState {
             self.attach_output_statistics(&mut event);
             self.attach_input_statistics(&mut event);
         }
-        if let Some(facets) = &self.facets {
-            facets.emit(&self.client, event);
-        } else {
-            self.client.emit(event);
-        }
+        self.client.emit(event);
     }
 
     /// Attach an `outputStatistics` facet to each output dataset of the COMPLETE
@@ -309,22 +327,24 @@ impl OpenLineageExec {
         complete: RunEvent,
         producer: String,
     ) -> Arc<Self> {
-        Self::new_with_facets(inner, client, complete, producer, None)
+        Self::new_with_lineage(inner, client, complete, producer, None)
     }
 
-    pub(crate) fn new_with_facets(
+    pub(crate) fn new_with_lineage(
         inner: Arc<dyn ExecutionPlan>,
         client: OpenLineageClient,
         complete: RunEvent,
         producer: String,
-        facets: Option<Arc<PreparedFacets>>,
+        lineage: Option<Arc<LineageRun>>,
     ) -> Arc<Self> {
-        let has_outputs = !complete.outputs.is_empty();
+        let has_outputs = lineage
+            .as_ref()
+            .map_or(!complete.outputs.is_empty(), |run| run.has_outputs);
         let state = Arc::new(RunState {
             client,
             complete,
             producer,
-            facets,
+            lineage,
             has_outputs,
             inner: std::sync::Mutex::new(inner.clone()),
             // Initialized lazily on the first `execute()` from the partition
@@ -427,7 +447,7 @@ impl ExecutionPlan for OpenLineageExec {
             Ok(inner) => inner,
             Err(err) => {
                 self.state.record_error(err.to_string());
-                self.state.partition_finished();
+                let _ = self.state.partition_finished();
                 return Err(err);
             }
         };
@@ -436,6 +456,7 @@ impl ExecutionPlan for OpenLineageExec {
             inner,
             state: self.state.clone(),
             done: false,
+            terminal: None,
         }))
     }
 }
@@ -447,13 +468,14 @@ struct TrackedStream {
     inner: SendableRecordBatchStream,
     state: Arc<RunState>,
     done: bool,
+    terminal: Option<BoxFuture<'static, ()>>,
 }
 
 impl TrackedStream {
     fn finish(&mut self) {
         if !self.done {
             self.done = true;
-            self.state.partition_finished();
+            self.terminal = self.state.partition_finished();
         }
     }
 }
@@ -462,6 +484,15 @@ impl Stream for TrackedStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            if let Some(terminal) = self.terminal.as_mut()
+                && terminal.as_mut().poll(cx).is_pending()
+            {
+                return Poll::Pending;
+            }
+            self.terminal = None;
+            return Poll::Ready(None);
+        }
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 // Only sniff for a write-result `count` batch when this run
@@ -482,7 +513,7 @@ impl Stream for TrackedStream {
             }
             Poll::Ready(None) => {
                 self.finish();
-                Poll::Ready(None)
+                self.poll_next(cx)
             }
             Poll::Pending => Poll::Pending,
         }
