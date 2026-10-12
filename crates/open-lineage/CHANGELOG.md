@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/datafusion-contrib/datafusion-openlineage/compare/datafusion-openlineage-v0.0.9...datafusion-openlineage-v0.0.10) - 2026-10-12
+
+### Added
+
+- [**breaking**] defer output lineage until successful completion (#12)
+
 ## [0.0.9](https://github.com/datafusion-contrib/datafusion-openlineage/compare/datafusion-openlineage-v0.0.8...datafusion-openlineage-v0.0.9) - 2026-10-10
 
 ### Added
