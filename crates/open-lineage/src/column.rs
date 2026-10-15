@@ -173,6 +173,10 @@ pub(crate) fn resolve_output_columns(
             }
             // No column values are written.
             WriteOp::Delete | WriteOp::Truncate => None,
+            // MERGE writes per-clause assignments that aren't positionally
+            // aligned with the target; `WriteOp` is non-exhaustive, so later
+            // variants land here too. No column lineage rather than a wrong one.
+            _ => None,
         },
         // `CREATE TABLE ... AS SELECT` lowers to CreateMemoryTable; the new
         // table's fields are exactly the query's output fields. `CREATE VIEW`

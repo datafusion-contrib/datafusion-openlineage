@@ -20,12 +20,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::catalog::memory::MemorySchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
+use datafusion::common::TableReference;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::execution::context::SessionState;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
-use datafusion::sql::TableReference;
 use datafusion_openlineage::DataFusionConfig;
 use datafusion_openlineage::config::OpenLineageConfig;
 use datafusion_openlineage::context::{LineageContext, LineageContextProvider};
@@ -81,7 +81,7 @@ struct StageContext {
 
 #[async_trait]
 impl LineageContextProvider for StageContext {
-    async fn context(&self, _state: &SessionState) -> LineageContext {
+    async fn context(&self, _state: &dyn Session) -> LineageContext {
         LineageContext {
             job_namespace: Some(self.job_namespace.clone()),
             job_name: Some(self.job_name.clone()),

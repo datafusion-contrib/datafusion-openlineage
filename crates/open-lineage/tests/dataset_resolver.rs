@@ -12,12 +12,12 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
+use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider, TableType, provider_as_source};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::sql::TableReference;
 use datafusion_openlineage::builder::start_event;
 use datafusion_openlineage::facets::SymlinkIdentifier;
 use datafusion_openlineage::{

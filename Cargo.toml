@@ -5,16 +5,16 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.91"
+rust-version = "1.94"
 
 [workspace.dependencies]
-arrow = "58"
+arrow = "59"
 async-trait = { version = "^0.1.89" }
 chrono = { version = "0.4.44", features = ["serde"] }
 config = "0.15.19"
-datafusion = "54"
-datafusion-common = "54"
-datafusion-expr = "54"
+datafusion = "55"
+datafusion-common = "55"
+datafusion-expr = "55"
 futures = "0.3.32"
 object_store = { version = "0.13.2", features = ["azure", "aws", "gcp"] }
 olai-http = { version = "0.0.6", features = ["connectrpc"] }
