@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use chrono::{DateTime, Utc};
 
+use datafusion::catalog::Session;
 use datafusion::common::Result;
-use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::PhysicalPlanner;
@@ -79,7 +79,7 @@ impl LineageHandle {
     pub async fn create_physical_plan(
         self,
         planner: &dyn PhysicalPlanner,
-        session_state: &SessionState,
+        session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let marked_plan = self.marker();
         match planner
@@ -263,7 +263,7 @@ pub fn begin_lineage<'a>(
     context: &'a dyn LineageContextProvider,
     config: &'a OpenLineageConfig,
     plan: &'a LogicalPlan,
-    session_state: &'a SessionState,
+    session_state: &'a dyn Session,
 ) -> LineageBuilder<'a> {
     LineageBuilder {
         client,
@@ -283,7 +283,7 @@ pub struct LineageBuilder<'a> {
     context: &'a dyn LineageContextProvider,
     config: &'a OpenLineageConfig,
     plan: &'a LogicalPlan,
-    session_state: &'a SessionState,
+    session_state: &'a dyn Session,
     resolvers: Vec<Arc<dyn DatasetResolver>>,
     facets: FacetRegistry,
 }

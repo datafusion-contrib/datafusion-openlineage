@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use common::{FailingTransport, RecordingTransport};
 use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::prelude::SessionContext;
 use datafusion_openlineage::builder::{complete_event, fail_event, start_event};
 use datafusion_openlineage::config::OpenLineageConfig;
@@ -693,10 +694,7 @@ struct FixedContextProvider(LineageContext);
 
 #[async_trait]
 impl LineageContextProvider for FixedContextProvider {
-    async fn context(
-        &self,
-        _state: &datafusion::execution::context::SessionState,
-    ) -> LineageContext {
+    async fn context(&self, _state: &dyn datafusion::catalog::Session) -> LineageContext {
         self.0.clone()
     }
 }
@@ -1072,6 +1070,16 @@ impl datafusion::physical_plan::ExecutionPlan for ExecErrorExec {
     fn children(&self) -> Vec<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         vec![]
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
@@ -1134,6 +1142,16 @@ impl datafusion::physical_plan::ExecutionPlan for OkExec {
     }
     fn children(&self) -> Vec<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         vec![]
+    }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
     fn with_new_children(
         self: Arc<Self>,
@@ -1221,7 +1239,10 @@ async fn partition_count_change_emits_one_terminal() {
     let inner: Arc<dyn ExecutionPlan> = Arc::new(OkExec::new(1));
     let exec = OpenLineageExec::new(inner, client, complete, cfg.producer.clone());
     let rewritten = Arc::clone(&exec)
-        .with_new_children(vec![Arc::new(OkExec::new(3))])
+        .replace_children(
+            vec![Arc::new(OkExec::new(3))],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap();
     assert_eq!(
         rewritten.output_partitioning().partition_count(),

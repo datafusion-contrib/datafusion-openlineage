@@ -3,9 +3,10 @@ mod common;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::catalog::Session;
 use datafusion::common::{DFSchema, DataFusionError, Result};
 use datafusion::datasource::MemTable;
-use datafusion::execution::SessionState;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
@@ -736,7 +737,7 @@ impl PhysicalPlanner for RetainingPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert!(
             matches!(logical_plan, LogicalPlan::Extension(e) if e.node.name() == "LineageMarker")
@@ -758,10 +759,11 @@ impl PhysicalPlanner for RetainingPlanner {
         &self,
         expr: &Expr,
         input_dfschema: &DFSchema,
-        session_state: &SessionState,
+        session_state: &dyn Session,
+        planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         self.inner
-            .create_physical_expr(expr, input_dfschema, session_state)
+            .create_physical_expr(expr, input_dfschema, session_state, planning_ctx)
     }
 }
 

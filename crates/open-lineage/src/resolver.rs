@@ -4,10 +4,10 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{TableProvider, source_as_provider};
 use datafusion::logical_expr::{DdlStatement, LogicalPlan, TableSource, WriteOp};
-use datafusion::sql::TableReference;
 
 use crate::DatasetName;
 use crate::facets::SymlinkIdentifier;

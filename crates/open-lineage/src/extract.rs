@@ -157,6 +157,9 @@ fn lifecycle_for(op: &WriteOp) -> Option<&'static str> {
         WriteOp::Insert(InsertOp::Overwrite | InsertOp::Replace) => Some("OVERWRITE"),
         WriteOp::Insert(InsertOp::Append) | WriteOp::Update | WriteOp::Delete => None,
         WriteOp::Truncate => Some("TRUNCATE"),
+        // MERGE (and any later `WriteOp` variant) carries no clean spec-enum
+        // equivalent.
+        _ => None,
     }
 }
 
@@ -226,7 +229,11 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                 }
             }
             LogicalPlan::Dml(dml) => match dml.op {
-                WriteOp::Insert(_) | WriteOp::Update | WriteOp::Delete | WriteOp::Ctas => {
+                WriteOp::Insert(_)
+                | WriteOp::Update
+                | WriteOp::Delete
+                | WriteOp::Ctas
+                | WriteOp::MergeInto(_) => {
                     self.outputs.push(OutputTable {
                         name: self.names.get(
                             &dml.table_name,
@@ -240,7 +247,8 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
                         symlinks: Vec::new(),
                     });
                 }
-                WriteOp::Truncate => {}
+                // `WriteOp` is non-exhaustive: unknown ops record no output.
+                _ => {}
             },
             LogicalPlan::Ddl(ddl) => match ddl {
                 DdlStatement::CreateExternalTable(cmd) => {
