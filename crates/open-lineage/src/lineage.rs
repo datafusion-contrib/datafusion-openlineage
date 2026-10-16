@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use chrono::{DateTime, Utc};
 
+use datafusion::catalog::Session;
 use datafusion::common::Result;
-use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::PhysicalPlanner;
@@ -79,13 +79,10 @@ impl LineageHandle {
     pub async fn create_physical_plan(
         self,
         planner: &dyn PhysicalPlanner,
-        session_state: &SessionState,
+        session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let marked_plan = self.marker();
-        match planner
-            .create_physical_plan(&marked_plan, session_state)
-            .await
-        {
+        match planner.create_physical_plan(&marked_plan, session).await {
             Ok(plan) => {
                 self.disarm();
                 Ok(plan)
@@ -250,7 +247,7 @@ impl Drop for Completion {
 /// # use datafusion_openlineage::*;
 /// # async fn example(client: &OpenLineageClient, context: &dyn LineageContextProvider,
 /// # config: &OpenLineageConfig, plan: &datafusion::logical_expr::LogicalPlan,
-/// # state: &datafusion::execution::SessionState, resolvers: &[std::sync::Arc<dyn DatasetResolver>], facets: &FacetRegistry) {
+/// # state: &dyn datafusion::catalog::Session, resolvers: &[std::sync::Arc<dyn DatasetResolver>], facets: &FacetRegistry) {
 /// let handle = begin_lineage(client, context, config, plan, state)
 ///     .with_resolvers(resolvers)
 ///     .with_facets(facets)
@@ -263,14 +260,14 @@ pub fn begin_lineage<'a>(
     context: &'a dyn LineageContextProvider,
     config: &'a OpenLineageConfig,
     plan: &'a LogicalPlan,
-    session_state: &'a SessionState,
+    session: &'a dyn Session,
 ) -> LineageBuilder<'a> {
     LineageBuilder {
         client,
         context,
         config,
         plan,
-        session_state,
+        session,
         resolvers: Vec::new(),
         facets: FacetRegistry::default(),
     }
@@ -283,7 +280,7 @@ pub struct LineageBuilder<'a> {
     context: &'a dyn LineageContextProvider,
     config: &'a OpenLineageConfig,
     plan: &'a LogicalPlan,
-    session_state: &'a SessionState,
+    session: &'a dyn Session,
     resolvers: Vec<Arc<dyn DatasetResolver>>,
     facets: FacetRegistry,
 }
@@ -315,7 +312,7 @@ impl LineageBuilder<'_> {
             context,
             config,
             plan,
-            session_state,
+            session,
             resolvers,
             facets,
         } = self;
@@ -332,13 +329,13 @@ impl LineageBuilder<'_> {
         }
         let has_outputs = !inputs.outputs.is_empty();
         inputs.outputs.clear();
-        let context = context.context(session_state).await;
+        let context = context.context(session).await;
         inputs.sql = context.sql.clone();
         let run_id = context.run_id.unwrap_or_else(Uuid::now_v7);
         let facets = facets
             .prepare(&QueryContext {
                 run_id,
-                session_state,
+                session,
                 logical_plan: plan,
                 lineage: &inputs,
                 context: &context,

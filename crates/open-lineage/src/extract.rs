@@ -10,10 +10,11 @@
 
 use std::sync::Arc;
 
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::error::Result;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{DdlStatement, LogicalPlan, WriteOp};
+use datafusion::logical_expr::{DdlStatement, LogicalPlan, TableSource, WriteOp};
 
 use crate::column::{ResolvedColumns, resolve_output_columns};
 use crate::config::OpenLineageConfig;
@@ -155,8 +156,8 @@ fn lifecycle_for(op: &WriteOp) -> Option<&'static str> {
     match op {
         WriteOp::Ctas => Some("CREATE"),
         WriteOp::Insert(InsertOp::Overwrite | InsertOp::Replace) => Some("OVERWRITE"),
-        WriteOp::Insert(InsertOp::Append) | WriteOp::Update | WriteOp::Delete => None,
         WriteOp::Truncate => Some("TRUNCATE"),
+        _ => None,
     }
 }
 
@@ -195,6 +196,21 @@ struct LineageVisitor<'a> {
     outputs: Vec<OutputTable>,
 }
 
+impl LineageVisitor<'_> {
+    fn record_input(&mut self, table_ref: &TableReference, source: &Arc<dyn TableSource>) {
+        let name = self.names.get(table_ref, Some(source), DatasetAccess::Read);
+        // A self-join or MERGE can read one dataset through multiple plan nodes.
+        if !self.inputs.iter().any(|input| input.name == name) {
+            self.inputs.push(InputTable {
+                name,
+                // Preserve the full table schema across projection pushdown.
+                fields: schema_fields(source.schema().fields()),
+                symlinks: Vec::new(),
+            });
+        }
+    }
+}
+
 impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
     type Node = LogicalPlan;
 
@@ -207,41 +223,23 @@ impl TreeNodeVisitor<'_> for LineageVisitor<'_> {
             // queries (no inputs + no outputs => no events).
             LogicalPlan::TableScan(scan) if is_information_schema(&scan.table_name) => {}
             LogicalPlan::TableScan(scan) => {
-                let dataset =
-                    self.names
-                        .get(&scan.table_name, Some(&scan.source), DatasetAccess::Read);
-                // Report the *full* table schema, not the projected scan schema:
-                // after projection pushdown `SELECT a FROM t` would otherwise
-                // report `t` as having only column `a`, causing the dataset's
-                // schema version to flap between queries.
-                let fields = schema_fields(scan.source.schema().fields());
-                // Dedupe by dataset identity: a self-join scans the same table
-                // twice but it is a single input dataset.
-                if !self.inputs.iter().any(|i| i.name == dataset) {
-                    self.inputs.push(InputTable {
-                        name: dataset,
-                        fields,
-                        symlinks: Vec::new(),
-                    });
-                }
+                self.record_input(&scan.table_name, &scan.source);
             }
-            LogicalPlan::Dml(dml) => match dml.op {
-                WriteOp::Insert(_) | WriteOp::Update | WriteOp::Delete | WriteOp::Ctas => {
-                    self.outputs.push(OutputTable {
-                        name: self.names.get(
-                            &dml.table_name,
-                            Some(&dml.target),
-                            DatasetAccess::Write,
-                        ),
-                        // The write target's full table schema -> the output's columns.
-                        fields: schema_fields(dml.target.schema().fields()),
-                        column_lineage: None,
-                        lifecycle: lifecycle_for(&dml.op),
-                        symlinks: Vec::new(),
-                    });
+            LogicalPlan::Dml(dml) if dml.op != WriteOp::Truncate => {
+                if matches!(dml.op, WriteOp::MergeInto(_)) {
+                    self.record_input(&dml.table_name, &dml.target);
                 }
-                WriteOp::Truncate => {}
-            },
+                self.outputs.push(OutputTable {
+                    name: self
+                        .names
+                        .get(&dml.table_name, Some(&dml.target), DatasetAccess::Write),
+                    // The write target's full table schema -> the output's columns.
+                    fields: schema_fields(dml.target.schema().fields()),
+                    column_lineage: None,
+                    lifecycle: lifecycle_for(&dml.op),
+                    symlinks: Vec::new(),
+                });
+            }
             LogicalPlan::Ddl(ddl) => match ddl {
                 DdlStatement::CreateExternalTable(cmd) => {
                     self.outputs.push(OutputTable {

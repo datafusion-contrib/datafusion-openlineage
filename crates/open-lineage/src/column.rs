@@ -173,6 +173,7 @@ pub(crate) fn resolve_output_columns(
             }
             // No column values are written.
             WriteOp::Delete | WriteOp::Truncate => None,
+            _ => degrade(plan, "no column lineage resolution for write operation"),
         },
         // `CREATE TABLE ... AS SELECT` lowers to CreateMemoryTable; the new
         // table's fields are exactly the query's output fields. `CREATE VIEW`

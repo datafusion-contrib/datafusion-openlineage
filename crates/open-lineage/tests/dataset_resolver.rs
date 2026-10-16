@@ -12,12 +12,12 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
+use datafusion::common::TableReference;
 use datafusion::datasource::{MemTable, TableProvider, TableType, provider_as_source};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion::sql::TableReference;
 use datafusion_openlineage::builder::start_event;
 use datafusion_openlineage::facets::SymlinkIdentifier;
 use datafusion_openlineage::{
@@ -311,13 +311,51 @@ async fn no_match_preserves_existing_events_and_allows_execution() {
             .config(cfg)
             .dataset_resolver(resolver),
     );
-    register_tables(&ctx);
+    // Installing instrumentation must preserve the tables already registered.
     ctx.sql("SELECT a FROM src")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn merge_resolves_target_as_both_input_and_output() {
+    let ctx = SessionContext::new();
+    ctx.register_table("src", Arc::new(StorageTable::new("source")))
+        .unwrap();
+    ctx.register_table("dst", Arc::new(StorageTable::new("destination")))
+        .unwrap();
+    let plan = ctx
+        .state()
+        .create_logical_plan(
+            "MERGE INTO dst USING src ON dst.a = src.a \
+             WHEN MATCHED THEN UPDATE SET b = src.b",
+        )
+        .await
+        .unwrap();
+    let resolver = Arc::new(ProviderResolver::default());
+    let resolvers: Vec<Arc<dyn DatasetResolver>> = vec![resolver.clone()];
+    let lineage = extract_with_resolvers(&plan, &config(), &resolvers).await;
+
+    assert_eq!(lineage.inputs.len(), 2);
+    for (table, canonical) in [("src", "source"), ("dst", "destination")] {
+        let input = lineage
+            .inputs
+            .iter()
+            .find(|input| input.name == name(canonical))
+            .unwrap();
+        assert_eq!(input.symlinks, vec![alias(table)]);
+    }
+    assert_eq!(lineage.outputs.len(), 1);
+    assert_eq!(lineage.outputs[0].name, name("destination"));
+    assert_eq!(lineage.outputs[0].symlinks, vec![alias("dst")]);
+    let calls = resolver.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    for access in [DatasetAccess::Read, DatasetAccess::Write] {
+        assert!(calls.contains(&(TableReference::bare("dst"), access, true)));
+    }
 }
 
 fn scan(table_ref: &str, source: Arc<dyn TableSource>) -> LogicalPlan {

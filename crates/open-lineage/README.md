@@ -7,6 +7,9 @@ run events — `START` at plan time, `COMPLETE` / `FAIL` at end of execution, al
 one run id — describing the query's input and output datasets, their schemas, and
 column-level lineage.
 
+Requires **DataFusion 55.2** and **Rust 1.94** or newer. Arrow types are available
+through `datafusion::arrow`.
+
 ## What you get
 
 - **Table-level lineage** — input datasets (with full table schemas) and output
@@ -47,6 +50,9 @@ let state = OpenLineage::builder().from_env()?.instrument(state);
 
 Inject orchestration metadata (parent run, job name, custom facets, SQL text) per
 query with a [`LineageContextProvider`]: `OpenLineage::builder().context(provider)`.
+Its `context` method receives `&dyn datafusion::catalog::Session`. Facet factories
+access the same session through `QueryContext.session`, including its session ID,
+configuration, and catalogs.
 The lower-level `instrument_session_state` / `instrument_session_state_simple`
 free functions remain for advanced cases (e.g. sharing one client across many
 sessions, each with its own context provider).

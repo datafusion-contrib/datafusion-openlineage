@@ -24,10 +24,16 @@ use std::task::{Context, Poll};
 use chrono::Utc;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::assert_eq_or_internal_err;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+    ReplaceChildrenOptions,
+};
 use futures::{FutureExt, Stream, future::BoxFuture};
 
 use crate::client::OpenLineageClient;
@@ -55,13 +61,13 @@ struct RunState {
     producer: String,
     lineage: Option<Arc<LineageRun>>,
     /// The wrapped plan, read for native runtime metrics on completion. Tracked
-    /// through `with_new_children` rewrites so metrics come from the node that
+    /// through `replace_children` rewrites so metrics come from the node that
     /// actually executed.
     inner: std::sync::Mutex<Arc<dyn ExecutionPlan>>,
     /// Outstanding partitions yet to finish. Initialized lazily from the
     /// executing node's partition count on the first `execute()` (see
     /// [`RunState::init_partitions`]) so it stays correct across
-    /// `with_new_children` rewrites that change the partitioning.
+    /// `replace_children` rewrites that change the partitioning.
     remaining: AtomicUsize,
     /// Guards one-time initialization of `remaining`.
     init: std::sync::Once,
@@ -349,7 +355,7 @@ impl OpenLineageExec {
             inner: std::sync::Mutex::new(inner.clone()),
             // Initialized lazily on the first `execute()` from the partition
             // count of the node that actually runs (which may differ from
-            // `inner` here after a `with_new_children` rewrite).
+            // `inner` here after a `replace_children` rewrite).
             remaining: AtomicUsize::new(0),
             init: std::sync::Once::new(),
             failed: AtomicBool::new(false),
@@ -393,12 +399,8 @@ impl ExecutionPlan for OpenLineageExec {
         "OpenLineageExec"
     }
 
-    // No `as_any` override: as of DataFusion 54 it is no longer an
-    // `ExecutionPlan` method — the trait now requires `Any`, so downcasting
-    // goes through `Any::downcast_ref` on `&dyn ExecutionPlan`, which resolves
-    // to *this* wrapper (not the inner plan). That is exactly the behavior the
-    // former override existed to guarantee: visitors can't downcast past the
-    // wrapper to the inner type and silently drop this lineage node.
+    // Downcasting resolves to this wrapper, so optimizer visitors cannot bypass
+    // it and silently drop lineage instrumentation.
 
     fn properties(&self) -> &Arc<PlanProperties> {
         self.inner.properties()
@@ -408,14 +410,34 @@ impl ExecutionPlan for OpenLineageExec {
         vec![&self.inner]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    // Still required by DataFusion 55; keep replacement logic in one method.
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        assert_eq_or_internal_err!(children.len(), 1, "OpenLineageExec requires one child");
         // We wrap a single root; rewrap whatever child we're given so the node
-        // stays installed across optimizer/child rewrites.
-        let child = children.pop().unwrap_or_else(|| self.inner.clone());
-        Ok(self.with_new_inner(child))
+        // stays installed across optimizer/child rewrites. Properties are always
+        // read from the child, so both property modes use the same path.
+        Ok(self.with_new_inner(children.swap_remove(0)))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -428,7 +450,7 @@ impl ExecutionPlan for OpenLineageExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         // Lazily fix the outstanding-partition count from the node that is
-        // actually executing, so `with_new_children` rewrites that change the
+        // actually executing, so `replace_children` rewrites that change the
         // partitioning don't desync the counter (reading `self.properties()`,
         // which delegates to `inner`, rather than the count captured at
         // construction). `init_partitions` floors the count at 1 so that if a
