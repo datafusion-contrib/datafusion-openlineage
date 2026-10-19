@@ -486,6 +486,39 @@ async fn literal_insert_emits_no_column_lineage() {
     );
 }
 
+/// MERGE writes a known target, but its conditional actions do not have a
+/// supported column mapping. Keep dataset edges without inventing that mapping.
+#[tokio::test]
+async fn merge_keeps_table_lineage_without_column_or_lifecycle_facets() {
+    let ctx = SessionContext::new();
+    ctx.sql("CREATE TABLE dst (id INT, value INT) AS VALUES (1, 10)")
+        .await
+        .unwrap();
+    ctx.sql("CREATE TABLE src (id INT, value INT) AS VALUES (1, 20)")
+        .await
+        .unwrap();
+    let event = event_for(
+        &ctx,
+        "MERGE INTO dst USING src ON dst.id = src.id \
+         WHEN MATCHED THEN UPDATE SET value = src.value \
+         WHEN NOT MATCHED THEN INSERT (id, value) VALUES (src.id, src.value)",
+    )
+    .await;
+    assert_eq!(event["outputs"].as_array().unwrap().len(), 1);
+    assert_eq!(event["outputs"][0]["name"], "dst");
+    let inputs: Vec<_> = event["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|input| input["name"].as_str().unwrap())
+        .collect();
+    assert!(inputs.contains(&"src"), "source input: {event}");
+    assert!(inputs.contains(&"dst"), "target input: {event}");
+    let facets = &event["outputs"][0]["facets"];
+    assert!(facets.get("columnLineage").is_none(), "{event}");
+    assert!(facets.get("lifecycleStateChange").is_none(), "{event}");
+}
+
 /// Unresolvable plans degrade by dropping the whole facet — never guessing —
 /// while table-level lineage is unaffected.
 #[tokio::test]

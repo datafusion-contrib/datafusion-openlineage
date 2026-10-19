@@ -6,6 +6,7 @@
 //! case is [`OpenLineageBuilder::from_env`] followed by
 //! [`OpenLineageBuilder::instrument`].
 
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -174,18 +175,8 @@ impl OpenLineageBuilder {
         for resolver in self.dataset_resolvers {
             planner = planner.with_dataset_resolver(resolver);
         }
-        let planner = Arc::new(planner);
-        // Also stash the planner as a typed `SessionConfig` extension so the
-        // `SessionContext`-level DDL path ([`OpenLineageSqlExt::sql_with_lineage`])
-        // can recover it: the `QueryPlanner` trait isn't `Any`, so `query_planner()`
-        // can't be downcast, but a config extension is keyed by type and retrieved
-        // with `get_extension::<OpenLineageQueryPlanner>()`. One `Arc`, two roles —
-        // the registered query planner and the extension are the same instance.
-        let mut session_config = state.config().clone();
-        session_config.set_extension(planner.clone());
         SessionStateBuilder::from(state)
-            .with_config(session_config)
-            .with_query_planner(planner)
+            .with_query_planner(Arc::new(planner))
             .build()
     }
 }
@@ -271,10 +262,8 @@ pub trait OpenLineageSqlExt: Sized {
 #[async_trait]
 impl OpenLineageSqlExt for SessionContext {
     fn with_lineage(self, builder: impl Into<Option<OpenLineageBuilder>>) -> Self {
-        // Mirror `enable_url_table`: consume the context, instrument its state, and
-        // rebuild. `instrument` both registers the query planner and stashes the
-        // planner as a config extension, so `sql_with_lineage` can recover it. A
-        // `None` builder is the empty default builder (no-op client, default cfg).
+        // Mirror `enable_url_table`: consume the context, instrument its state,
+        // and rebuild. A `None` builder uses the default no-op client and config.
         let builder = builder.into().unwrap_or_default();
         SessionContext::new_with_state(builder.instrument(self.state()))
     }
@@ -284,7 +273,8 @@ impl OpenLineageSqlExt for SessionContext {
     }
 
     async fn sql_with_lineage(&self, sql: &str) -> DataFusionResult<DataFrame> {
-        let plan = self.state().create_logical_plan(sql).await?;
+        let state = self.state();
+        let plan = state.create_logical_plan(sql).await?;
 
         // Only DDL that carries a SELECT body (CTAS / CREATE VIEW) is stolen from
         // the planner; for everything else the planner path already produces
@@ -297,13 +287,9 @@ impl OpenLineageSqlExt for SessionContext {
             return self.execute_logical_plan(plan).await;
         }
 
-        // An instrumented session carries the planner as a config extension; an
-        // uninstrumented one does not, so this transparently degrades to plain
-        // execution (no events) there.
-        match self
-            .state()
-            .config()
-            .get_extension::<OpenLineageQueryPlanner>()
+        // Use the installed planner as the single source of instrumentation.
+        // Sessions with another planner execute normally.
+        match (state.query_planner().as_ref() as &dyn Any).downcast_ref::<OpenLineageQueryPlanner>()
         {
             Some(planner) => planner.execute_ddl_with_lineage(self, plan, sql).await,
             None => self.execute_logical_plan(plan).await,

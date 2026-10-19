@@ -46,6 +46,7 @@ fn register(ctx: &SessionContext) {
 #[derive(Debug, Default)]
 struct Calls {
     factories: AtomicUsize,
+    sessions: Mutex<Vec<String>>,
     dataset_checks: AtomicUsize,
     builds: Mutex<Vec<(Uuid, RunEventType, &'static str, String)>>,
     origins: Mutex<Vec<(String, DatasetAccess, usize, usize)>>,
@@ -86,6 +87,11 @@ impl FacetBuilderFactory for Probes {
 
     async fn create(&self, cx: &QueryContext<'_>) -> Result<FacetBuilders, FacetError> {
         self.0.factories.fetch_add(1, Ordering::Relaxed);
+        self.0
+            .sessions
+            .lock()
+            .unwrap()
+            .push(cx.session.session_id().to_owned());
         tokio::task::yield_now().await;
         for dataset in cx.datasets {
             let providers = dataset
@@ -264,6 +270,7 @@ async fn scopes_targets_and_callbacks_follow_actual_emission() {
         .await
         .unwrap();
     assert_eq!(calls.factories.load(Ordering::Relaxed), 1);
+    assert_eq!(*calls.sessions.lock().unwrap(), vec![ctx.session_id()]);
     assert_eq!(calls.dataset_checks.load(Ordering::Relaxed), 2);
     assert!(
         calls

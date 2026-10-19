@@ -2,13 +2,11 @@
 //!
 //! OpenLineage instrumentation has three concerns with different needs (see ADR
 //! 0005): lineage *extraction* needs the optimized `LogicalPlan`; the START event
-//! and orchestration context need `&SessionState` and are async; the terminal
+//! and orchestration context need `&dyn Session` and are async; the terminal
 //! COMPLETE/FAIL node needs to sit at the physical root and observe execution.
-//! Only the [`QueryPlanner`] seam has `&SessionState`, so the planning-time work
-//! lives there — but the terminal node is installed the composable, DataFusion-
-//! idiomatic way: a registered [`ExtensionPlanner`] lowers a plan-carried marker
-//! into [`OpenLineageExec`], rather than the planner hand-wrapping the physical
-//! root.
+//! The [`QueryPlanner`] receives the optimized logical plan and session, so the
+//! planning-time work lives there. A registered [`ExtensionPlanner`] lowers a
+//! plan-carried marker into [`OpenLineageExec`] at the physical root.
 //!
 //! Flow, all under one `run_id`. First, [`OpenLineageQueryPlanner`] (the
 //! [`QueryPlanner`]) extracts lineage from the optimized logical plan, resolves
@@ -29,9 +27,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::catalog::Session;
 use datafusion::common::{DFSchemaRef, Result};
 use datafusion::dataframe::DataFrame;
-use datafusion::execution::context::{QueryPlanner, SessionContext, SessionState};
+use datafusion::execution::context::{QueryPlanner, SessionContext};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{
     Expr, InvariantLevel, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
@@ -69,7 +69,7 @@ pub(crate) fn nested_lineage_suppressed() -> bool {
 // ---------------------------------------------------------------------------
 
 /// A logical no-op wrapping the real plan, carrying the per-query lineage payload
-/// from [`OpenLineageQueryPlanner`] (which has `&SessionState`) to
+/// from [`OpenLineageQueryPlanner`] (which has `&dyn Session`) to
 /// [`LineageExtensionPlanner`] (which installs the terminal node). Schema-
 /// transparent: it reports its input's schema so optimization and physical
 /// planning treat it as a pass-through.
@@ -190,7 +190,8 @@ impl ExtensionPlanner for LineageExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        _session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // Not our node: let another extension planner handle it.
         let Some(marker) = node.as_any().downcast_ref::<LineageMarker>() else {
@@ -217,7 +218,7 @@ impl ExtensionPlanner for LineageExtensionPlanner {
 
 /// A [`QueryPlanner`] that emits OpenLineage events around a query.
 ///
-/// It does the `&SessionState`-bound, async work — extract lineage, resolve
+/// It does the `&dyn Session`-bound, async work — extract lineage, resolve
 /// context, emit START, mint the `run_id`, emit FAIL on a planning error — then
 /// hands off to physical planning by wrapping the logical plan in a
 /// [`LineageMarker`]. The registered [`LineageExtensionPlanner`] lowers that
@@ -275,14 +276,14 @@ impl OpenLineageQueryPlanner {
     async fn begin_lineage(
         &self,
         plan: &LogicalPlan,
-        session_state: &SessionState,
+        session: &dyn Session,
     ) -> Option<LineageHandle> {
         begin_lineage(
             &self.client,
             self.context.as_ref(),
             &self.config,
             plan,
-            session_state,
+            session,
         )
         .with_resolvers(&self.dataset_resolvers)
         .with_facets(&self.facets)
@@ -359,20 +360,20 @@ impl QueryPlanner for OpenLineageQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Extract lineage, resolve context, and emit START — or, when the query
         // touches no datasets, plan straight through without a marker so no events
         // fire.
-        let Some(handle) = self.begin_lineage(logical_plan, session_state).await else {
+        let Some(handle) = self.begin_lineage(logical_plan, session).await else {
             return self
                 .physical
-                .create_physical_plan(logical_plan, session_state)
+                .create_physical_plan(logical_plan, session)
                 .await;
         };
 
         handle
-            .create_physical_plan(self.physical.as_ref(), session_state)
+            .create_physical_plan(self.physical.as_ref(), session)
             .await
     }
 }
@@ -383,6 +384,7 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
     use uuid::Uuid;
 
+    use datafusion::execution::SessionState;
     use datafusion::logical_expr::LogicalPlanBuilder;
 
     use super::*;

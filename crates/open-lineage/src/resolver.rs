@@ -4,10 +4,10 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{TableProvider, source_as_provider};
 use datafusion::logical_expr::{DdlStatement, LogicalPlan, TableSource, WriteOp};
-use datafusion::sql::TableReference;
 
 use crate::DatasetName;
 use crate::facets::SymlinkIdentifier;
@@ -125,22 +125,30 @@ struct DatasetRequest {
 }
 
 impl DatasetRequest {
-    fn from_plan(plan: &LogicalPlan) -> Option<Self> {
-        let (table_ref, source, access) = match plan {
-            LogicalPlan::TableScan(scan) if !is_information_schema(&scan.table_name) => {
-                (&scan.table_name, Some(&scan.source), DatasetAccess::Read)
+    fn from_plan(plan: &LogicalPlan, access: DatasetAccess) -> Option<Self> {
+        let (table_ref, source) = match (plan, access) {
+            (LogicalPlan::TableScan(scan), DatasetAccess::Read)
+                if !is_information_schema(&scan.table_name) =>
+            {
+                (&scan.table_name, Some(&scan.source))
             }
-            LogicalPlan::Dml(dml) if dml.op != WriteOp::Truncate => {
-                (&dml.table_name, Some(&dml.target), DatasetAccess::Write)
+            (LogicalPlan::Dml(dml), DatasetAccess::Read)
+                if matches!(dml.op, WriteOp::MergeInto(_)) =>
+            {
+                // MERGE reads its target without a TableScan in its input plan.
+                (&dml.table_name, Some(&dml.target))
             }
-            LogicalPlan::Ddl(ddl) => {
+            (LogicalPlan::Dml(dml), DatasetAccess::Write) if dml.op != WriteOp::Truncate => {
+                (&dml.table_name, Some(&dml.target))
+            }
+            (LogicalPlan::Ddl(ddl), DatasetAccess::Write) => {
                 let name = match ddl {
                     DdlStatement::CreateExternalTable(cmd) => &cmd.name,
                     DdlStatement::CreateMemoryTable(cmd) => &cmd.name,
                     DdlStatement::CreateView(cmd) => &cmd.name,
                     _ => return None,
                 };
-                (name, None, DatasetAccess::Write)
+                (name, None)
             }
             _ => return None,
         };
@@ -207,10 +215,12 @@ impl DatasetNames {
         // This walk never errors. Keep the visitors synchronous and await only
         // the metadata lookups, once per distinct request (including fallback).
         let _ = plan.apply(|node| {
-            if let Some(request) = DatasetRequest::from_plan(node)
-                && access.is_none_or(|access| access == request.access)
-            {
-                requests.push(request);
+            for mode in [DatasetAccess::Read, DatasetAccess::Write] {
+                if access.is_none_or(|access| access == mode)
+                    && let Some(request) = DatasetRequest::from_plan(node, mode)
+                {
+                    requests.push(request);
+                }
             }
             Ok(TreeNodeRecursion::Continue)
         });

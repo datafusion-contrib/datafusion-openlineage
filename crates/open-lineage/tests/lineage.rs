@@ -6,7 +6,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::{FailingTransport, RecordingTransport};
-use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlanProperties, ReplaceChildrenOptions,
+    replace_children_if_necessary,
+};
 use datafusion::prelude::SessionContext;
 use datafusion_openlineage::builder::{complete_event, fail_event, start_event};
 use datafusion_openlineage::config::OpenLineageConfig;
@@ -693,10 +698,7 @@ struct FixedContextProvider(LineageContext);
 
 #[async_trait]
 impl LineageContextProvider for FixedContextProvider {
-    async fn context(
-        &self,
-        _state: &datafusion::execution::context::SessionState,
-    ) -> LineageContext {
+    async fn context(&self, _session: &dyn datafusion::catalog::Session) -> LineageContext {
         self.0.clone()
     }
 }
@@ -1072,9 +1074,25 @@ impl datafusion::physical_plan::ExecutionPlan for ExecErrorExec {
     fn children(&self) -> Vec<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         vec![]
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+    fn replace_children(
+        self: Arc<Self>,
         _children: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         Ok(self)
     }
@@ -1090,8 +1108,8 @@ impl datafusion::physical_plan::ExecutionPlan for ExecErrorExec {
 }
 
 /// A trivial single-batch source with a configurable partition count, used to
-/// prove the partition counter tracks `with_new_children` rewrites.
-#[derive(Debug)]
+/// prove the partition counter tracks `replace_children` rewrites.
+#[derive(Debug, Clone)]
 struct OkExec {
     properties: Arc<datafusion::physical_plan::PlanProperties>,
     schema: datafusion::arrow::datatypes::SchemaRef,
@@ -1135,9 +1153,25 @@ impl datafusion::physical_plan::ExecutionPlan for OkExec {
     fn children(&self) -> Vec<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         vec![]
     }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+    fn replace_children(
+        self: Arc<Self>,
         _children: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         Ok(self)
     }
@@ -1200,6 +1234,17 @@ async fn execute_error_emits_fail_exactly_once() {
 
 #[tokio::test]
 async fn partition_count_change_emits_one_terminal() {
+    assert_child_rewrite_completes(OkExec::new(1), OkExec::new(3)).await;
+}
+
+#[tokio::test]
+async fn same_properties_child_rewrite_emits_one_terminal() {
+    let inner = OkExec::new(1);
+    // Different nodes sharing PlanProperties exercise ChildrenPropertiesMode::Keep.
+    assert_child_rewrite_completes(inner.clone(), inner).await;
+}
+
+async fn assert_child_rewrite_completes(inner: OkExec, replacement: OkExec) {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion_openlineage::OpenLineageExec;
     use datafusion_openlineage::builder::complete_event;
@@ -1215,23 +1260,20 @@ async fn partition_count_change_emits_one_terminal() {
         &cfg,
     );
 
-    // Wrap a 1-partition plan, then rewrite the child to a 3-partition plan via
-    // `with_new_children`. The terminal-event counter must follow the node that
-    // actually executes (3 partitions), emitting exactly one COMPLETE.
-    let inner: Arc<dyn ExecutionPlan> = Arc::new(OkExec::new(1));
-    let exec = OpenLineageExec::new(inner, client, complete, cfg.producer.clone());
-    let rewritten = Arc::clone(&exec)
-        .with_new_children(vec![Arc::new(OkExec::new(3))])
-        .unwrap();
+    let replacement: Arc<dyn ExecutionPlan> = Arc::new(replacement);
+    let partitions = replacement.output_partitioning().partition_count();
+    let exec = OpenLineageExec::new(Arc::new(inner), client, complete, cfg.producer.clone());
+    let rewritten = replace_children_if_necessary(exec, vec![replacement.clone()]).unwrap();
+    assert!(Arc::ptr_eq(rewritten.children()[0], &replacement));
     assert_eq!(
         rewritten.output_partitioning().partition_count(),
-        3,
+        partitions,
         "rewritten node reports the new partition count"
     );
 
     let ctx = SessionContext::new();
     let task_ctx = ctx.task_ctx();
-    for p in 0..3 {
+    for p in 0..partitions {
         let mut stream = rewritten.execute(p, task_ctx.clone()).unwrap();
         use futures::StreamExt;
         while stream.next().await.is_some() {}
@@ -1247,10 +1289,7 @@ async fn partition_count_change_emits_one_terminal() {
         .iter()
         .filter(|e| e.run.run_id == run_id && e.event_type == RunEventType::Fail)
         .count();
-    assert_eq!(
-        completes, 1,
-        "exactly one COMPLETE after a partition-count-changing rewrite"
-    );
+    assert_eq!(completes, 1, "exactly one COMPLETE after a child rewrite");
     assert_eq!(fails, 0, "no spurious FAIL");
 }
 
@@ -1497,8 +1536,7 @@ async fn uninstrumented_session_falls_through() {
     ctx.sql("CREATE TABLE src (a INT) AS VALUES (1)")
         .await
         .unwrap();
-    // A CTAS still creates the table (no panic, no error) even with no planner
-    // extension to recover.
+    // A CTAS still creates the table without a lineage query planner.
     ctx.sql_with_lineage("CREATE TABLE dst AS SELECT a FROM src")
         .await
         .unwrap();
@@ -1510,6 +1548,33 @@ async fn uninstrumented_session_falls_through() {
         .await
         .unwrap();
     assert!(!n.is_empty(), "dst was created by the fall-through CTAS");
+}
+
+#[tokio::test]
+async fn replacing_query_planner_removes_ddl_instrumentation() {
+    use datafusion::execution::SessionStateBuilder;
+
+    let transport = RecordingTransport::default();
+    let client = OpenLineageClient::new(Arc::new(transport.clone()));
+    let ctx = SessionContext::new();
+    let default_planner = ctx.state().query_planner().clone();
+    ctx.sql("CREATE TABLE src (a INT) AS VALUES (1)")
+        .await
+        .unwrap();
+    let ctx = ctx.with_lineage(OpenLineage::builder().client(client.clone()));
+    let state = SessionStateBuilder::from(ctx.state())
+        .with_query_planner(default_planner)
+        .build();
+    drop(ctx);
+    let ctx = SessionContext::new_with_state(state);
+
+    ctx.sql_with_lineage("CREATE TABLE dst AS SELECT a FROM src")
+        .await
+        .unwrap();
+    ctx.table("dst").await.unwrap();
+    drop(ctx);
+    client.shutdown().await;
+    assert!(transport.events.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -15,7 +15,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::execution::context::SessionState;
+use datafusion::catalog::Session;
 use datafusion::logical_expr::LogicalPlan;
 use futures::FutureExt;
 use serde::{Serialize, de::DeserializeOwned};
@@ -113,7 +113,7 @@ pub struct QueryContext<'a> {
     /// Run ID shared by all events for this query.
     pub run_id: Uuid,
     /// The session planning the query.
-    pub session_state: &'a SessionState,
+    pub session: &'a dyn Session,
     /// Logical plan used for lineage extraction.
     pub logical_plan: &'a LogicalPlan,
     /// Extracted table and column lineage.
