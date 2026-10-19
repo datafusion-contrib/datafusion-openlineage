@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/datafusion-contrib/datafusion-openlineage/compare/datafusion-openlineage-v0.0.10...datafusion-openlineage-v0.0.11) - 2026-10-19
+
+### Added
+
+- [**breaking**] upgrade to DataFusion 55 (#15)
+
 ## [0.0.10](https://github.com/datafusion-contrib/datafusion-openlineage/compare/datafusion-openlineage-v0.0.9...datafusion-openlineage-v0.0.10) - 2026-10-12
 
 ### Added
