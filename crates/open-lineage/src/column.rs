@@ -19,10 +19,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use datafusion::common::DFSchema;
 use datafusion::common::tree_node::TreeNode;
+use datafusion::logical_expr::dml::{MergeIntoAction, MergeIntoClauseKind, MergeIntoOp};
 use datafusion::logical_expr::utils::grouping_set_to_exprlist;
 use datafusion::logical_expr::{
-    CreateMemoryTable, CreateView, DdlStatement, Distinct, Expr, JoinType, LogicalPlan, WriteOp,
+    CreateMemoryTable, CreateView, DdlStatement, Distinct, DmlStatement, Expr, JoinType,
+    LogicalPlan, WriteOp,
 };
 
 use crate::naming::DatasetName;
@@ -171,6 +174,8 @@ pub(crate) fn resolve_output_columns(
                 }
                 Some(keyed_by(resolved, |i| target.field(i).name().clone()))
             }
+            WriteOp::MergeInto(ref merge) => resolve_merge(dml, merge, names)
+                .or_else(|| degrade(plan, "no column lineage resolution for MERGE operation")),
             // No column values are written.
             WriteOp::Delete | WriteOp::Truncate => None,
             _ => degrade(plan, "no column lineage resolution for write operation"),
@@ -193,6 +198,154 @@ pub(crate) fn resolve_output_columns(
         // dataset, so there is no output to attach the facet to.
         _ => None,
     }
+}
+
+/// Union the values written by MERGE actions, not the untouched rows of the
+/// destination. An UPDATE carries its unassigned columns through from the
+/// target; INSERT starts with no target provenance; DELETE writes no values.
+/// Predicates remain statement-wide influences, as for ordinary joins/filters.
+fn resolve_merge(
+    dml: &DmlStatement,
+    merge: &MergeIntoOp,
+    names: &DatasetNames,
+) -> Option<ResolvedColumns> {
+    if merge
+        .clauses
+        .iter()
+        .all(|clause| matches!(clause.action, MergeIntoAction::Delete))
+    {
+        return None;
+    }
+
+    let source = resolve(&dml.input, names)?;
+    let target = dml.target.schema();
+    // DataFusion 55 canonicalizes the target alias to dml.table_name.
+    let target_schema =
+        DFSchema::try_from_qualified_schema(dml.table_name.clone(), &target).ok()?;
+    let schema = target_schema.join(dml.input.schema()).ok()?;
+    // SQL resolves qualifiers, but manually constructed plans may not. Reject
+    // ambiguous references rather than letting positional lookup pick a side.
+    for expr in merge.exprs() {
+        for column in expr.column_refs() {
+            schema
+                .field_with_name(column.relation.as_ref(), &column.name)
+                .ok()?;
+        }
+    }
+    let dataset = names.get(&dml.table_name, Some(&dml.target), DatasetAccess::Read);
+    let target_columns: Vec<_> = target
+        .fields()
+        .iter()
+        .map(|field| {
+            ColumnSources::single(
+                SourceColumn {
+                    dataset: dataset.clone(),
+                    column: field.name().clone(),
+                },
+                DirectKind::Identity,
+            )
+        })
+        .collect();
+    let target_len = target_columns.len();
+    let mut scope = target_columns.clone();
+    scope.extend(source.columns);
+    let mut resolved = NodeLineage {
+        columns: vec![ColumnSources::default(); target_len],
+        indirect: source.indirect,
+    };
+    let on = expr_sources_in_schema(&merge.on, &schema, &scope, DirectKind::Identity)?;
+    add_indirect(
+        &mut resolved.indirect,
+        on.direct.into_keys().collect(),
+        IndirectKind::Join,
+    );
+
+    for clause in &merge.clauses {
+        // The absent side of an unmatched row supplies NULLs, not input values.
+        let mut clause_scope = scope.clone();
+        match clause.kind {
+            MergeIntoClauseKind::Matched => {}
+            MergeIntoClauseKind::NotMatched | MergeIntoClauseKind::NotMatchedByTarget => {
+                clause_scope[..target_len].fill(ColumnSources::default());
+            }
+            MergeIntoClauseKind::NotMatchedBySource => {
+                clause_scope[target_len..].fill(ColumnSources::default());
+            }
+        }
+        if let Some(predicate) = &clause.predicate {
+            let sources =
+                expr_sources_in_schema(predicate, &schema, &clause_scope, DirectKind::Identity)?;
+            add_indirect(
+                &mut resolved.indirect,
+                sources.direct.into_keys().collect(),
+                IndirectKind::Filter,
+            );
+        }
+
+        let columns = match &clause.action {
+            MergeIntoAction::Update(assignments) => {
+                if clause.kind.is_not_matched_by_target() {
+                    return None;
+                }
+                let mut columns = target_columns.clone();
+                let mut assigned = BTreeSet::new();
+                for (name, expr) in assignments {
+                    let i = target.index_of(name).ok()?;
+                    if !assigned.insert(i) {
+                        return None;
+                    }
+                    // Resolve all assignments against the old row, never
+                    // against a preceding assignment in the same action.
+                    columns[i] =
+                        expr_sources_in_schema(expr, &schema, &clause_scope, DirectKind::Identity)?;
+                }
+                columns
+            }
+            MergeIntoAction::Insert { columns, values } => {
+                if !clause.kind.is_not_matched_by_target() {
+                    return None;
+                }
+                let indices = if columns.is_empty() {
+                    (0..target_len).collect::<Vec<_>>()
+                } else {
+                    columns
+                        .iter()
+                        .map(|name| target.index_of(name).ok())
+                        .collect::<Option<_>>()?
+                };
+                let assigned: BTreeSet<_> = indices.iter().copied().collect();
+                if indices.len() != values.len() || assigned.len() != indices.len() {
+                    return None;
+                }
+                let mut columns = vec![ColumnSources::default(); target_len];
+                for (i, expr) in indices.into_iter().zip(values) {
+                    columns[i] =
+                        expr_sources_in_schema(expr, &schema, &clause_scope, DirectKind::Identity)?;
+                }
+                // Omitted fields use NULL/defaults. Column-dependent defaults
+                // need provider-specific resolution; do not silently drop them.
+                for (i, field) in target.fields().iter().enumerate() {
+                    if !assigned.contains(&i)
+                        && let Some(default) = dml.target.get_column_default(field.name())
+                        && (has_hidden_sources(default) || !default.column_refs().is_empty())
+                    {
+                        return None;
+                    }
+                }
+                columns
+            }
+            MergeIntoAction::Delete => {
+                if clause.kind.is_not_matched_by_target() {
+                    return None;
+                }
+                continue;
+            }
+        };
+        for (output, sources) in resolved.columns.iter_mut().zip(&columns) {
+            output.merge(sources);
+        }
+    }
+    Some(keyed_by(resolved, |i| target.field(i).name().clone()))
 }
 
 fn keyed_by(node: NodeLineage, name: impl Fn(usize) -> String) -> ResolvedColumns {
@@ -547,18 +700,30 @@ fn expr_sources(
     child: &NodeLineage,
     min: DirectKind,
 ) -> Option<ColumnSources> {
+    expr_sources_in_schema(expr, child_plan.schema(), &child.columns, min)
+        .or_else(|| degrade(child_plan, "unresolvable expression or subquery"))
+}
+
+/// MERGE expressions use the combined target/source schema, which is not the
+/// schema of its sole input plan. Share the expression rules with projections.
+fn expr_sources_in_schema(
+    expr: &Expr,
+    schema: &DFSchema,
+    columns: &[ColumnSources],
+    min: DirectKind,
+) -> Option<ColumnSources> {
     if has_hidden_sources(expr) {
-        return degrade(child_plan, "subquery in expression");
+        return None;
     }
     let inner = peel_aliases(expr);
     if let Expr::Column(col) = inner {
-        let i = child_plan.schema().maybe_index_of_column(col)?;
-        return Some(child.columns[i].clone().upgraded(min));
+        let i = schema.maybe_index_of_column(col)?;
+        return Some(columns.get(i)?.clone().upgraded(min));
     }
     let mut sources = ColumnSources::default();
     for col in inner.column_refs() {
-        let i = child_plan.schema().maybe_index_of_column(col)?;
-        sources.merge(&child.columns[i]);
+        let i = schema.maybe_index_of_column(col)?;
+        sources.merge(columns.get(i)?);
     }
     Some(sources.upgraded(min.max(DirectKind::Transformation)))
 }
@@ -597,6 +762,7 @@ fn has_hidden_sources(expr: &Expr) -> bool {
             Expr::Exists(_)
                 | Expr::InSubquery(_)
                 | Expr::ScalarSubquery(_)
+                | Expr::SetComparison(_)
                 | Expr::OuterReferenceColumn(_, _)
         ))
     })

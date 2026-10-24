@@ -16,7 +16,8 @@ through `datafusion::arrow`.
   datasets, extracted from the optimized `LogicalPlan`.
 - **Column-level lineage** — sound, positional bottom-up resolution over the
   optimized plan (handles aliases, CTEs, self-joins, projections, joins,
-  aggregations, window functions). Degrades cleanly rather than guessing.
+  aggregations, window functions, and `MERGE INTO`). Unresolved mappings omit the
+  column-lineage facet.
 - **Run lifecycle** — `START` / `COMPLETE` / `FAIL` correlated by a single run id,
   with terminal events fired at *end of execution* (a query that plans but errors
   mid-stream reports `FAIL`, not `COMPLETE`).
