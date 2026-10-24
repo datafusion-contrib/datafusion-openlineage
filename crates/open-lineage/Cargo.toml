@@ -1,6 +1,6 @@
 [package]
 name = "datafusion-openlineage"
-version = "0.0.11"
+version = "0.0.12"
 description = "OpenLineage integration for Apache DataFusion sessions"
 edition.workspace = true
 license.workspace = true

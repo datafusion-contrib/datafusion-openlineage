@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/datafusion-contrib/datafusion-openlineage/compare/datafusion-openlineage-v0.0.11...datafusion-openlineage-v0.0.12) - 2026-10-24
+
+### Added
+
+- add column lineage support for MERGE INTO (#17)
+
 ## [0.0.11](https://github.com/datafusion-contrib/datafusion-openlineage/compare/datafusion-openlineage-v0.0.10...datafusion-openlineage-v0.0.11) - 2026-10-19
 
 ### Added
