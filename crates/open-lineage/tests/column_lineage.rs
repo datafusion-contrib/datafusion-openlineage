@@ -486,10 +486,10 @@ async fn literal_insert_emits_no_column_lineage() {
     );
 }
 
-/// MERGE writes a known target, but its conditional actions do not have a
-/// supported column mapping. Keep dataset edges without inventing that mapping.
+/// MERGE combines the values written by UPDATE and INSERT actions, keeping
+/// target reads and the existing table/lifecycle behavior.
 #[tokio::test]
-async fn merge_keeps_table_lineage_without_column_or_lifecycle_facets() {
+async fn merge_combines_update_and_insert_lineage() {
     let ctx = SessionContext::new();
     ctx.sql("CREATE TABLE dst (id INT, value INT) AS VALUES (1, 10)")
         .await
@@ -515,8 +515,417 @@ async fn merge_keeps_table_lineage_without_column_or_lifecycle_facets() {
     assert!(inputs.contains(&"src"), "source input: {event}");
     assert!(inputs.contains(&"dst"), "target input: {event}");
     let facets = &event["outputs"][0]["facets"];
-    assert!(facets.get("columnLineage").is_none(), "{event}");
     assert!(facets.get("lifecycleStateChange").is_none(), "{event}");
+    assert!(has_source(
+        input_fields(&event, "value"),
+        "src",
+        "value",
+        "DIRECT",
+        "IDENTITY"
+    ));
+    assert!(!has_source(
+        input_fields(&event, "value"),
+        "dst",
+        "value",
+        "DIRECT",
+        "IDENTITY"
+    ));
+    for table in ["src", "dst"] {
+        assert!(has_source(
+            input_fields(&event, "id"),
+            table,
+            "id",
+            "DIRECT",
+            "IDENTITY"
+        ));
+        assert!(has_source(
+            input_fields(&event, "value"),
+            table,
+            "id",
+            "INDIRECT",
+            "JOIN"
+        ));
+    }
+}
+
+async fn merge_context() -> SessionContext {
+    let ctx = SessionContext::new();
+    ctx.sql("CREATE TABLE dst (id INT, value INT, kept INT) AS VALUES (1, 10, 100)")
+        .await
+        .unwrap();
+    ctx.sql("CREATE TABLE src (id INT, value INT, extra INT) AS VALUES (1, 20, 200)")
+        .await
+        .unwrap();
+    ctx
+}
+
+#[tokio::test]
+async fn merge_update_resolves_aliases_old_values_and_unchanged_columns() {
+    let ctx = merge_context().await;
+    let event = event_for(
+        &ctx,
+        "MERGE INTO dst AS d USING src AS s ON d.id = s.id \
+         WHEN MATCHED AND s.extra > 0 THEN UPDATE SET value = d.kept + s.value, kept = d.value",
+    )
+    .await;
+    let value = input_fields(&event, "value");
+    assert!(has_source(value, "dst", "kept", "DIRECT", "TRANSFORMATION"));
+    assert!(has_source(
+        value,
+        "src",
+        "value",
+        "DIRECT",
+        "TRANSFORMATION"
+    ));
+    // Assignments are simultaneous: kept reads the old value, not the new sum.
+    let kept = input_fields(&event, "kept");
+    assert!(has_source(kept, "dst", "value", "DIRECT", "IDENTITY"));
+    assert!(!has_source(
+        kept,
+        "src",
+        "value",
+        "DIRECT",
+        "TRANSFORMATION"
+    ));
+    assert!(has_source(
+        input_fields(&event, "id"),
+        "dst",
+        "id",
+        "DIRECT",
+        "IDENTITY"
+    ));
+    for field in ["id", "value", "kept"] {
+        assert!(has_source(
+            input_fields(&event, field),
+            "src",
+            "extra",
+            "INDIRECT",
+            "FILTER"
+        ));
+    }
+    assert!(
+        referenced_datasets(&event)
+            .iter()
+            .all(|name| name == "src" || name == "dst")
+    );
+}
+
+#[tokio::test]
+async fn merge_insert_maps_reordered_implicit_and_partial_columns() {
+    let ctx = merge_context().await;
+    for action in [
+        "INSERT (kept, id, value) VALUES (src.extra, src.id, src.value)",
+        "INSERT VALUES (src.id, src.value, src.extra)",
+    ] {
+        for kind in ["NOT MATCHED", "NOT MATCHED BY TARGET"] {
+            let event = event_for(
+                &ctx,
+                &format!("MERGE INTO dst USING src ON dst.id = src.id WHEN {kind} THEN {action}"),
+            )
+            .await;
+            for (field, source) in [("id", "id"), ("value", "value"), ("kept", "extra")] {
+                let inputs = input_fields(&event, field);
+                assert!(has_source(inputs, "src", source, "DIRECT", "IDENTITY"));
+                assert!(!inputs.iter().any(|input| {
+                    input["name"] == "dst"
+                        && input["transformations"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|t| t["type"] == "DIRECT")
+                }));
+            }
+        }
+    }
+    let event = event_for(
+        &ctx,
+        "MERGE INTO dst USING src ON dst.id = src.id \
+         WHEN NOT MATCHED THEN INSERT (id, value) VALUES (src.id, 42)",
+    )
+    .await;
+    // Constants and omitted NULL/default columns have no direct provenance.
+    assert!(has_source(
+        input_fields(&event, "id"),
+        "src",
+        "id",
+        "DIRECT",
+        "IDENTITY"
+    ));
+    assert!(facet(&event)["fields"].get("value").is_none());
+    assert!(facet(&event)["fields"].get("kept").is_none());
+}
+
+#[tokio::test]
+async fn merge_unions_branches_and_keeps_delete_predicates_indirect() {
+    let ctx = merge_context().await;
+    let event = event_for(
+        &ctx,
+        "MERGE INTO dst USING src ON dst.id = src.id \
+         WHEN MATCHED AND src.extra < 0 THEN DELETE \
+         WHEN MATCHED AND dst.kept > 0 THEN UPDATE SET value = src.value \
+         WHEN MATCHED THEN UPDATE SET value = src.extra + dst.value \
+         WHEN NOT MATCHED THEN INSERT (id, value) VALUES (src.id, src.value)",
+    )
+    .await;
+    let value = input_fields(&event, "value");
+    assert!(has_source(value, "src", "value", "DIRECT", "IDENTITY"));
+    assert!(has_source(
+        value,
+        "src",
+        "extra",
+        "DIRECT",
+        "TRANSFORMATION"
+    ));
+    assert!(has_source(
+        value,
+        "dst",
+        "value",
+        "DIRECT",
+        "TRANSFORMATION"
+    ));
+    assert!(has_source(value, "src", "extra", "INDIRECT", "FILTER"));
+    assert!(has_source(value, "dst", "kept", "INDIRECT", "FILTER"));
+    assert!(has_source(
+        input_fields(&event, "kept"),
+        "dst",
+        "kept",
+        "DIRECT",
+        "IDENTITY"
+    ));
+}
+
+#[tokio::test]
+async fn merge_not_matched_by_source_preserves_target_provenance() {
+    let ctx = merge_context().await;
+    let event = event_for(
+        &ctx,
+        "MERGE INTO dst USING src ON dst.id = src.id \
+         WHEN NOT MATCHED BY SOURCE AND dst.kept > 0 THEN UPDATE SET value = dst.value + 1",
+    )
+    .await;
+    assert!(has_source(
+        input_fields(&event, "value"),
+        "dst",
+        "value",
+        "DIRECT",
+        "TRANSFORMATION"
+    ));
+    assert!(has_source(
+        input_fields(&event, "kept"),
+        "dst",
+        "kept",
+        "DIRECT",
+        "IDENTITY"
+    ));
+    assert!(has_source(
+        input_fields(&event, "value"),
+        "dst",
+        "kept",
+        "INDIRECT",
+        "FILTER"
+    ));
+    assert!(has_source(
+        input_fields(&event, "value"),
+        "src",
+        "id",
+        "INDIRECT",
+        "JOIN"
+    ));
+}
+
+#[tokio::test]
+async fn merge_absent_sides_do_not_supply_direct_values() {
+    let ctx = merge_context().await;
+    for (sql, absent_field) in [
+        (
+            "MERGE INTO dst USING src ON dst.id = src.id WHEN NOT MATCHED THEN INSERT (id, value) VALUES (src.id, dst.value)",
+            "value",
+        ),
+        (
+            "MERGE INTO dst USING src ON dst.id = src.id WHEN NOT MATCHED BY SOURCE THEN UPDATE SET value = src.value",
+            "value",
+        ),
+    ] {
+        let event = event_for(&ctx, sql).await;
+        assert!(facet(&event).is_object(), "{event}");
+        assert!(
+            facet(&event)["fields"].get(absent_field).is_none(),
+            "{event}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn merge_source_join_and_aggregate_resolve_to_base_columns() {
+    let ctx = merge_context().await;
+    ctx.sql("CREATE TABLE rates (id INT, rate INT) AS VALUES (1, 2)")
+        .await
+        .unwrap();
+    let event = event_for(
+        &ctx,
+        "MERGE INTO dst AS d USING (\
+           SELECT s.id, sum(s.value * r.rate) AS total FROM src AS s \
+           JOIN rates AS r ON s.id = r.id WHERE s.extra > 0 GROUP BY s.id\
+         ) AS totals ON d.id = totals.id \
+         WHEN MATCHED THEN UPDATE SET value = totals.total",
+    )
+    .await;
+    let inputs = input_fields(&event, "value");
+    assert!(has_source(inputs, "src", "value", "DIRECT", "AGGREGATION"));
+    assert!(has_source(inputs, "rates", "rate", "DIRECT", "AGGREGATION"));
+    assert!(has_source(inputs, "src", "extra", "INDIRECT", "FILTER"));
+    assert!(has_source(inputs, "src", "id", "INDIRECT", "GROUP_BY"));
+    assert!(has_source(inputs, "rates", "id", "INDIRECT", "JOIN"));
+    assert!(
+        referenced_datasets(&event)
+            .iter()
+            .all(|name| ["dst", "src", "rates"].contains(&name.as_str()))
+    );
+}
+
+#[tokio::test]
+async fn merge_self_reference_respects_source_projection() {
+    let ctx = merge_context().await;
+    let event = event_for(
+        &ctx,
+        "MERGE INTO dst AS d USING (SELECT id, kept AS value FROM dst) AS s \
+         ON d.id = s.id WHEN MATCHED THEN UPDATE SET value = s.value",
+    )
+    .await;
+    let inputs = input_fields(&event, "value");
+    assert!(has_source(inputs, "dst", "kept", "DIRECT", "IDENTITY"));
+    assert!(!has_source(inputs, "dst", "value", "DIRECT", "IDENTITY"));
+    assert_eq!(event["inputs"].as_array().unwrap().len(), 1);
+    assert!(referenced_datasets(&event).iter().all(|name| name == "dst"));
+}
+
+#[tokio::test]
+async fn merge_delete_only_and_literal_insert_omit_column_lineage() {
+    let ctx = merge_context().await;
+    for actions in [
+        "WHEN MATCHED THEN DELETE WHEN NOT MATCHED BY SOURCE THEN DELETE",
+        "WHEN NOT MATCHED THEN INSERT VALUES (1, 2, 3)",
+    ] {
+        let event = event_for(
+            &ctx,
+            &format!("MERGE INTO dst USING src ON dst.id = src.id {actions}"),
+        )
+        .await;
+        assert_eq!(event["inputs"].as_array().unwrap().len(), 2);
+        assert_eq!(event["outputs"][0]["name"], "dst");
+        assert!(event["outputs"][0]["facets"].get("columnLineage").is_none());
+        assert!(
+            event["outputs"][0]["facets"]
+                .get("lifecycleStateChange")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn merge_expression_subqueries_drop_the_whole_column_facet() {
+    let ctx = merge_context().await;
+    for sql in [
+        "MERGE INTO dst USING src ON dst.id = src.id AND EXISTS (SELECT 1 FROM src) WHEN MATCHED THEN UPDATE SET value = src.value",
+        "MERGE INTO dst USING src ON dst.id = src.id WHEN MATCHED AND EXISTS (SELECT 1 FROM src) THEN UPDATE SET value = src.value",
+        "MERGE INTO dst USING src ON dst.id = src.id WHEN MATCHED THEN UPDATE SET value = (SELECT max(value) FROM src)",
+        "MERGE INTO dst USING src ON dst.id = src.id WHEN NOT MATCHED THEN INSERT (id, value) VALUES (src.id, (SELECT max(value) FROM src))",
+        "MERGE INTO dst USING src ON dst.id = src.id WHEN MATCHED AND EXISTS (SELECT 1 FROM src) THEN DELETE WHEN NOT MATCHED THEN INSERT (id, value) VALUES (src.id, src.value)",
+    ] {
+        let event = event_for(&ctx, sql).await;
+        assert!(
+            event["outputs"][0]["facets"].get("columnLineage").is_none(),
+            "{sql}: {event}"
+        );
+        assert_eq!(event["inputs"].as_array().unwrap().len(), 2);
+        assert_eq!(event["outputs"][0]["name"], "dst");
+    }
+}
+
+#[tokio::test]
+async fn merge_insert_omitted_defaults_do_not_invent_sources() {
+    let ctx = merge_context().await;
+    ctx.sql("CREATE TABLE defaults (id INT, value INT DEFAULT 7)")
+        .await
+        .unwrap();
+    let event = event_for(
+        &ctx,
+        "MERGE INTO defaults USING src ON defaults.id = src.id \
+         WHEN NOT MATCHED THEN INSERT (id) VALUES (src.id)",
+    )
+    .await;
+    assert!(has_source(
+        input_fields(&event, "id"),
+        "src",
+        "id",
+        "DIRECT",
+        "IDENTITY"
+    ));
+    assert!(facet(&event)["fields"].get("value").is_none());
+}
+
+/// Public extraction accepts manually built plans as well as SQL plans. An
+/// invalid later branch must not leave a plausible but partial column facet.
+#[tokio::test]
+async fn merge_invalid_mapping_drops_the_whole_facet() {
+    use datafusion::logical_expr::dml::{MergeIntoAction, MergeIntoClauseKind};
+    use datafusion::logical_expr::{LogicalPlan, WriteOp, col};
+
+    let ctx = merge_context().await;
+    let base = ctx.state().create_logical_plan(
+        "MERGE INTO dst USING src ON dst.id = src.id WHEN MATCHED THEN UPDATE SET value = src.value"
+    ).await.unwrap();
+    for case in [
+        "unknown_output",
+        "unknown_input",
+        "ambiguous_input",
+        "duplicate_update",
+        "insert_arity",
+        "duplicate_insert",
+        "invalid_action",
+    ] {
+        let mut plan = base.clone();
+        let LogicalPlan::Dml(dml) = &mut plan else {
+            panic!("expected DML")
+        };
+        let WriteOp::MergeInto(merge) = &mut dml.op else {
+            panic!("expected MERGE")
+        };
+        let mut clause = merge.clauses[0].clone();
+        clause.action = match case {
+            "unknown_output" => MergeIntoAction::Update(vec![("missing".into(), col("src.value"))]),
+            "unknown_input" => MergeIntoAction::Update(vec![("value".into(), col("src.missing"))]),
+            "ambiguous_input" => MergeIntoAction::Update(vec![("value".into(), col("value"))]),
+            "duplicate_update" => MergeIntoAction::Update(vec![
+                ("value".into(), col("src.value")),
+                ("value".into(), col("src.extra")),
+            ]),
+            "insert_arity" => {
+                clause.kind = MergeIntoClauseKind::NotMatched;
+                MergeIntoAction::Insert {
+                    columns: vec![],
+                    values: vec![col("src.id")],
+                }
+            }
+            "duplicate_insert" => {
+                clause.kind = MergeIntoClauseKind::NotMatched;
+                MergeIntoAction::Insert {
+                    columns: vec!["value".into(), "value".into()],
+                    values: vec![col("src.value"), col("src.extra")],
+                }
+            }
+            "invalid_action" => {
+                clause.kind = MergeIntoClauseKind::NotMatched;
+                clause.action
+            }
+            _ => unreachable!(),
+        };
+        merge.clauses.push(clause);
+        let lineage = extract(&plan, &config());
+        assert!(lineage.outputs[0].column_lineage.is_none(), "{case}");
+        assert_eq!(lineage.inputs.len(), 2, "{case}");
+        assert_eq!(lineage.outputs[0].name.name, "dst", "{case}");
+    }
 }
 
 /// Unresolvable plans degrade by dropping the whole facet — never guessing —

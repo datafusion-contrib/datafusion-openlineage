@@ -351,6 +351,35 @@ async fn merge_resolves_target_as_both_input_and_output() {
     assert_eq!(lineage.outputs.len(), 1);
     assert_eq!(lineage.outputs[0].name, name("destination"));
     assert_eq!(lineage.outputs[0].symlinks, vec![alias("dst")]);
+    let columns = lineage.outputs[0].column_lineage.as_ref().unwrap();
+    for (field, canonical) in [("a", "destination"), ("b", "source")] {
+        let sources = &columns.fields[field].direct;
+        assert_eq!(sources.len(), 1);
+        let source = sources.keys().next().unwrap();
+        assert_eq!(source.dataset, name(canonical));
+        assert_eq!(source.column, field);
+    }
+    assert_eq!(columns.indirect.len(), 2);
+    assert!(columns.indirect.keys().all(|source| {
+        source.column == "a"
+            && lineage
+                .inputs
+                .iter()
+                .any(|input| input.name == source.dataset)
+    }));
+    // Target column provenance uses the read identity, even when the output
+    // resolves to a different dataset after the write.
+    let different = extract_with_resolvers(&plan, &config(), &[Arc::new(AccessResolver)]).await;
+    assert_eq!(different.outputs[0].name, name("after"));
+    let columns = different.outputs[0].column_lineage.as_ref().unwrap();
+    assert!(
+        columns
+            .fields
+            .values()
+            .flat_map(|field| field.direct.keys())
+            .chain(columns.indirect.keys())
+            .all(|source| source.dataset == name("before"))
+    );
     let calls = resolver.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
     for access in [DatasetAccess::Read, DatasetAccess::Write] {
