@@ -199,6 +199,58 @@ async fn sql_matrix_events_conform_to_core_schema() {
 // 2. The columnLineage facet validates against its own schema.
 // ---------------------------------------------------------------------------
 
+/// MERGE execution is provider-specific; exercise the host-managed lifecycle
+/// with a planned MERGE and validate the column facet on successful completion.
+#[tokio::test]
+async fn merge_column_lineage_facet_conforms() {
+    use datafusion_openlineage::{StaticContextProvider, begin_lineage};
+
+    let ctx = SessionContext::new();
+    for sql in [
+        "CREATE TABLE src (id INT, value INT) AS VALUES (1, 2)",
+        "CREATE TABLE dst (id INT, value INT) AS VALUES (1, 3)",
+    ] {
+        ctx.sql(sql).await.unwrap();
+    }
+    let state = ctx.state();
+    let plan = state
+        .create_logical_plan(
+            "MERGE INTO dst USING src ON dst.id = src.id \
+         WHEN MATCHED AND src.value > 0 THEN UPDATE SET value = dst.value + src.value \
+         WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.value)",
+        )
+        .await
+        .unwrap();
+    let plan = state.optimize(&plan).unwrap();
+    let transport = RecordingTransport::default();
+    let client = OpenLineageClient::new(Arc::new(transport.clone()));
+    let cfg = config();
+    let context = StaticContextProvider::default();
+    let handle = begin_lineage(&client, &context, &cfg, &plan, &state)
+        .start()
+        .await
+        .unwrap();
+    handle.complete().await;
+    client.shutdown().await;
+
+    let events = transport.events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events[0].outputs.is_empty());
+    let event = &events[1];
+    assert_valid(
+        &validator_for(CORE_SCHEMA),
+        &serde_json::to_value(event).unwrap(),
+        "MERGE event",
+    );
+    let facet = event.outputs[0].facets.column_lineage.as_ref().unwrap();
+    assert!(!facet.fields.is_empty());
+    assert_valid(
+        &validator_for(COLUMN_LINEAGE_FACET),
+        &wrapped("columnLineage", &serde_json::to_value(facet).unwrap()),
+        "MERGE column lineage",
+    );
+}
+
 #[tokio::test]
 async fn column_lineage_facet_conforms() {
     let validator = validator_for(COLUMN_LINEAGE_FACET);
