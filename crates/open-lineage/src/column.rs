@@ -219,10 +219,9 @@ fn resolve_merge(
 
     let source = resolve(&dml.input, names)?;
     let target = dml.target.schema();
-    // DataFusion 55 canonicalizes the target alias to dml.table_name.
-    let target_schema =
-        DFSchema::try_from_qualified_schema(dml.table_name.clone(), &target).ok()?;
-    let schema = target_schema.join(dml.input.schema()).ok()?;
+    // MERGE expressions see the target under its SQL-visible qualifier (the
+    // alias, if any, since DataFusion 56), followed by the source fields.
+    let schema = merge.expression_schema(&target, dml.input.schema()).ok()?;
     // SQL resolves qualifiers, but manually constructed plans may not. Reject
     // ambiguous references rather than letting positional lookup pick a side.
     for expr in merge.exprs() {
