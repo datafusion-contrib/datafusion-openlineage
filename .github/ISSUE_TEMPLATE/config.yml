@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/datafusion-contrib/datafusion-openlineage/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue.
+  - name: OpenLineage specification
+    url: https://openlineage.io/docs/
+    about: Questions about the OpenLineage spec itself belong with the OpenLineage project.
