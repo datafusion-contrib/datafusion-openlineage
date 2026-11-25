@@ -1,0 +1,44 @@
+name: Bug report
+description: Something doesn't work as documented, or lineage is wrong or missing.
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        A minimal example: SQL or DataFrame code, table definitions, and the
+        events emitted (`OPENLINEAGE_URL=console` logs them). Remove anything
+        sensitive.
+      render: rust
+    validations:
+      required: true
+  - type: input
+    id: crate-version
+    attributes:
+      label: Crate version(s)
+      placeholder: datafusion-openlineage 0.0.13, openlineage-client 0.0.5
+    validations:
+      required: true
+  - type: input
+    id: datafusion-version
+    attributes:
+      label: DataFusion version
+      placeholder: "56.0.0"
+  - type: input
+    id: backend
+    attributes:
+      label: Lineage backend
+      description: Where are events sent (Marquez, a custom HTTP endpoint, a custom Transport, …)?
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Logs, Rust version, OS, or other context.
