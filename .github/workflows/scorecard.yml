@@ -1,0 +1,44 @@
+name: Scorecard
+
+# OpenSSF Scorecard supply-chain checks (https://scorecard.dev). Results are
+# published to the public Scorecard API (README badge) and uploaded as SARIF to
+# GitHub code scanning (Security tab).
+
+on:
+  branch_protection_rule:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 5 * * 2" # Tuesdays 05:41 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    # The Scorecard API only accepts results from the canonical repository.
+    if: ${{ github.repository == 'datafusion-contrib/datafusion-openlineage' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # upload SARIF to code scanning
+      id-token: write # authenticate results to the Scorecard API
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: results.sarif
