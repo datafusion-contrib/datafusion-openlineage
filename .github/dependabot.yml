@@ -1,0 +1,38 @@
+# Dependabot version updates. Security updates are enabled separately in the
+# repository settings and ignore the cooldown below.
+#
+# Commit prefixes keep PR titles conventional so they pass pr-title.yml:
+#   ci(deps): ...     GitHub Actions (SHA pins and their `# vX` comments)
+#   chore(deps): ...  Cargo dependencies
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Let new releases age before adopting them (supply-chain hygiene).
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Matches the 7-day delay maintainers' crates.io proxy applies, so update
+    # PRs only propose versions that also resolve locally.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # Semver-compatible bumps land together; majors (e.g. DataFusion) get
+      # their own PRs since they usually need code changes.
+      cargo-compatible:
+        update-types: [minor, patch]

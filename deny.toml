@@ -1,0 +1,50 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+#
+# CI runs `cargo deny check bans licenses sources` as a required job (ci.yml)
+# and `cargo deny check advisories` on its own schedule (advisories.yml).
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on vulnerabilities and on unmaintained/unsound crates in the tree.
+# Add an `ignore` entry (with a reason) only for advisories that don't apply.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Permissive licenses only. An `A OR B` expression passes when either side is
+# allowed, so this list only needs the licenses some crate can't avoid.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "bzip2-1.0.6",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+
+[bans]
+# The DataFusion/Arrow tree routinely carries duplicate versions; report them
+# without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates depend on each other by path (with a version), which is fine.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
