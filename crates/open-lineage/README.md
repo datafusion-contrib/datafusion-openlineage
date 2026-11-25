@@ -7,7 +7,7 @@ run events — `START` at plan time, `COMPLETE` / `FAIL` at end of execution, al
 one run id — describing the query's input and output datasets, their schemas, and
 column-level lineage.
 
-Requires **DataFusion 55.2** and **Rust 1.94** or newer. Arrow types are available
+Requires **DataFusion 56** and **Rust 1.95** or newer. Arrow types are available
 through `datafusion::arrow`.
 
 ## What you get

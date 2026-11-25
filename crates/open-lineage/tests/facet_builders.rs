@@ -668,7 +668,7 @@ impl datafusion::datasource::TableProvider for PlanningFailure {
     async fn scan(
         &self,
         _: &dyn datafusion::catalog::Session,
-        _: Option<&Vec<usize>>,
+        _: Option<&[usize]>,
         _: &[datafusion::logical_expr::Expr],
         _: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
