@@ -11,37 +11,30 @@ coverage:
       default:
         informational: true
 
-# Exclude code we never want counted against coverage. The big skew is the
-# committed codegen (thousands of machine-generated lines tests never exercise
-# directly), which drags the denominator down: the buffa-generated proto message
-# types and the connectrpc service stubs, both in the headwaters-proto crate.
-# Also drop examples and test helpers (exercised by running them, not by
-# assertions).
-#
-# Paths are matched against the report's workspace-relative file paths. Keep this
-# in sync with the CI coverage job's `--ignore-filename-regex`. Regenerate the
-# codegen with `just proto-gen`.
+# Report each published crate separately in the PR comment and dashboard.
+component_management:
+  individual_components:
+    - component_id: datafusion-openlineage
+      name: datafusion-openlineage
+      paths:
+        - "crates/open-lineage/**"
+    - component_id: openlineage-client
+      name: openlineage-client
+      paths:
+        - "crates/openlineage-client/**"
+
+# Examples and test harnesses are exercised by running them, not measured.
+# Paths are matched against the report's workspace-relative file paths.
 ignore:
-  # Generated proto message types. The sibling proto/mod.rs is hand-written, so
-  # it is NOT ignored — only the `@generated` *.v1.rs files.
-  - "crates/headwaters-proto/src/proto/*.v1.rs"
-  # Every file under connect_gen/ is `@generated` (connectrpc service stubs).
-  - "crates/headwaters-proto/src/connect_gen/**"
-  # Process entry point: pure runtime wiring (pool, server, signal handling) that
-  # in-process integration tests don't drive — counting it only depresses the
-  # honest number, same rationale as the generated code above.
-  - "crates/headwaters/src/main.rs"
-  # A documented contract trait with no direct callers (the Postgres applier
-  # bypasses it; see the module docs), so there is nothing to exercise.
-  - "crates/headwaters/src/projection/applier.rs"
-  - "**/examples/**" # runnable examples, not unit-tested
-  - "**/tests/**" # integration test harnesses
+  - "**/examples/**"
+  - "**/tests/**"
   - "**/benches/**"
 
-# Public-repo tokenless upload; no CODECOV_TOKEN secret required.
+# CI uploads with OIDC (main and same-repo PRs) or tokenless (fork PRs); see
+# the `coverage` job in .github/workflows/ci.yml. No CODECOV_TOKEN secret.
 codecov:
   require_ci_to_pass: false
 
 comment:
-  layout: "reach, diff, flags, files"
+  layout: "reach, diff, flags, components, files"
   behavior: default
